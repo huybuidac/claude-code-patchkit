@@ -9,8 +9,10 @@ Community-contributed binary patches for [Claude Code CLI](https://docs.anthropi
 ### Option A: Agent Skills CLI (works with Claude Code, Cursor, Copilot, etc.)
 
 ```bash
-npx skills add huybuidac/claude-code-patchkit
+npx skills add huybuidac/claude-code-patchkit -g
 ```
+
+> The `-g` flag installs globally (user-level) so the skill is available in all projects. Without it, the skill is only available in the current project.
 
 ### Option B: Claude Code plugin system
 
