@@ -4,6 +4,9 @@ Community-contributed binary patches for [Claude Code CLI](https://docs.anthropi
 
 > **Disclaimer**: This is unofficial and not supported by Anthropic. It modifies the Claude Code binary. Use at your own risk. Keep backups and know how to reinstall Claude Code.
 
+<img width="1264" height="516" alt="image" src="https://github.com/user-attachments/assets/dbcb6e46-e1d4-4f9e-9708-1afbedae3efe" />
+
+
 ## Install
 
 ### Option A: Agent Skills CLI (works with Claude Code, Cursor, Copilot, etc.)
