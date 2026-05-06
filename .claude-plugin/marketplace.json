@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "claude-code-patchkit",
+  "description": "Community-contributed binary patches for Claude Code CLI",
+  "owner": {
+    "name": "huybuidac"
+  },
+  "plugins": [
+    {
+      "name": "claude-patch",
+      "description": "Patch Claude Code CLI binary to unlock hard-coded limitations like subagent model restrictions",
+      "source": "./",
+      "strict": false,
+      "category": "development",
+      "skills": [
+        "./skills/claude-patch"
+      ]
+    }
+  ]
+}
