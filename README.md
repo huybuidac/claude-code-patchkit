@@ -23,9 +23,17 @@ npx skills add huybuidac/claude-code-patchkit -g
 
 ## Prerequisites
 
-- macOS (arm64 tested, x86_64 expected to work)
+**macOS / Linux:**
+- macOS arm64 (tested) or x86_64 (expected to work); Linux (untested)
 - Python 3
-- `codesign` (ships with macOS)
+- `codesign` (macOS only — ships with macOS)
+
+**Windows 10/11:**
+- arm64 (tested) or x64 (expected to work)
+- PowerShell 5.1+
+- Node.js (LTS) on PATH — required for the bundled binary scanner
+
+**Both:**
 - Claude Code installed as native binary
 - Write permission to the Claude binary
 
@@ -55,8 +63,18 @@ Claude Code is distributed as a bun-compiled binary with embedded JS bundles. So
 3. **State detection** — determine unpatched / patched / abnormal before acting
 4. **Backup** — always saves `<binary>.bak.<timestamp>`
 5. **Length-preserving swap** — no offset shifts or blob corruption
-6. **Re-sign** — ad-hoc codesign for macOS
+6. **Re-sign / signature handling** — ad-hoc codesign on macOS; on Windows the Authenticode signature becomes `HashMismatch` (binary still runs)
 7. **Self-verify** — confirm marker count post-patch
+
+> Note: the bun-compiled binary embeds the JS bundle 1 or 2 times depending on platform/version (macOS ≤ 2.1.132 = 2, macOS ≥ 2.1.133 = 1, Windows = 1). Patch definitions detect the count dynamically rather than asserting a fixed number.
+
+### Windows specifics
+
+`claude.exe` is locked while running, so apply/revert use a **rename-swap** pattern:
+1. Copy → patch a `.patching` sidecar at the known offset
+2. `Rename-Item` the live `claude.exe` to `.replacing.<ts>` (same-volume rename works on a running .exe)
+3. `Move-Item` the patched copy into place
+4. Restart Claude Code to pick up the new binary; clean up `*.replacing.*` after exit
 
 ## Safety
 
@@ -83,13 +101,18 @@ Claude Code is distributed as a bun-compiled binary with embedded JS bundles. So
 
 - macOS arm64 (Apple Silicon) — tested
 - macOS x86_64 — should work (untested)
+- Windows 11 arm64 — tested
+- Windows 10/11 x64 — should work (untested)
 - Linux — binary layout may differ, contributions welcome
 
 ## Recovery
 
 - Backups are saved as `<binary>.bak.<timestamp>` next to the original
-- To manually restore: `cp <binary>.bak.<timestamp> <binary> && codesign --force --sign - <binary>`
-- To reinstall Claude Code: delete `~/.local/share/claude/` and re-run the installer
+- **macOS / Linux**: `cp <binary>.bak.<timestamp> <binary> && codesign --force --sign - <binary>` (skip `codesign` on Linux)
+- **Windows**: stop Claude Code, then use rename-swap — `Rename-Item claude.exe claude.exe.broken; Move-Item claude.exe.bak.<ts> claude.exe`. The backup retains the original Authenticode signature.
+- Clean up Windows `*.replacing.*` files after Claude Code has exited (they may stay on disk while the old process is still mapped)
+- **If your `.bak` size doesn't match the current binary** (Claude Code re-bundled within the same version), don't restore — the `/claude-patch revert` flow will detect this and offer in-place reverse-patch instead.
+- To reinstall Claude Code: delete the install dir (`~/.local/share/claude/` on Unix, `%USERPROFILE%\.local\bin\claude.exe` on Windows) and re-run the installer
 
 ## License
 
