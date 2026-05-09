@@ -502,10 +502,10 @@ Should succeed instead of failing schema validation.
 
 ## Post-patch behavior
 
-- `model` field accepts any string
-- Downstream resolver still handles aliases (`sonnet` → current sonnet, etc.)
-- Full model IDs pass through to API directly
-- Invalid model IDs fail at API call (400/404) rather than schema validation
+- `model` field accepts any string at the Task tool input layer.
+- Schema validation reads disk-binary state at each Agent invocation — the patch takes effect immediately on the next subagent spawn, no Claude Code restart required.
+- Downstream Claude Code resolver does substring matching (`be1` function): if the model id contains `opus`/`sonnet`/`haiku`, it routes to the corresponding default. Full model IDs that include those substrings (e.g., `claude-haiku-4-5-20251001`) get routed to the matching family.
+- Model IDs that don't match any family (e.g., `gpt-5.4-mini`) gracefully fall back to parent-inherit, NOT an API error. Don't rely on garbage IDs producing visible errors — they'll silently run on the parent's model.
 
 ## Caveats
 
@@ -516,7 +516,7 @@ Should succeed instead of failing schema validation.
 5. **Backup rotation** — each apply creates a `.bak.<ts>` file (~210 MB). After confirming a new version works, delete older backups:
    - Windows: `Get-ChildItem "$env:USERPROFILE\.local\bin\claude.exe.bak.*" | Sort-Object LastWriteTime -Descending | Select-Object -Skip 2 | Remove-Item`
    - Unix: `ls -t "$BIN".bak.* | tail -n +3 | xargs -r rm`
-6. **No validation** — garbage model IDs produce API errors (harder to debug than schema errors).
+6. **Silent fallback for garbage IDs** — model strings that don't match `opus`/`sonnet`/`haiku` substrings inherit from parent rather than producing a visible error. If you typo a model id, you may not notice until you check usage / `--debug` logs. (Original spec said "API 400/404"; empirical behavior is silent fallback — verified on 2.1.133 macOS.)
 7. **Bundle count is not stable** — macOS used 2-instance bundles up to 2.1.132 and switched to 1-instance from 2.1.133. Windows is 1-instance on all observed versions. State detection treats any positive anchor count as "unpatched" rather than asserting a fixed number.
 8. **Backup may be from a different sub-build** — Claude Code occasionally re-bundles within the same dot-version (different bytes, same `--version` string). The revert script size-checks `.bak` files and falls back to in-place reverse-patch when no backup matches the current build size.
 
@@ -527,4 +527,4 @@ Should succeed instead of failing schema validation.
 | 2026-05-06 | 1.0 | Initial — tested on 2.1.116, 2.1.119, 2.1.121 |
 | 2026-05-08 | 1.1 | Windows port — single-instance bundle, rename-swap for file-lock, Node-based scanner, signature left invalid |
 | 2026-05-08 | 1.1.1 | Self-review fixes: Windows scripts self-contained, `[DateTimeOffset]` instead of `Get-Date -UFormat`, parallel Unix/Windows verification blocks, backup rotation hint |
-| 2026-05-09 | 1.2.0 | Bundle count made dynamic on both platforms. macOS 2.1.133 switched from 2-instance to 1-instance bundle — old hard-coded `hits == 2` assertion would classify it as "abnormal" and abort. State detection now treats any positive anchor count as unpatched on both Unix and Windows; PowerShell apply loops over all anchor offsets instead of only the first. Added in-place reverse-patch fallback to both bash and PowerShell revert scripts, triggered when no `.bak.<ts>` matches current binary size (different sub-build). Tested on macOS 2.1.132 (2-instance) and 2.1.133 (1-instance); Windows scripts updated symmetrically but not retested on Windows since 1.1.1. |
+| 2026-05-09 | 1.2.0 | Bundle count made dynamic on both platforms. macOS 2.1.133 switched from 2-instance to 1-instance bundle — old hard-coded `hits == 2` assertion would classify it as "abnormal" and abort. State detection now treats any positive anchor count as unpatched on both Unix and Windows; PowerShell apply loops over all anchor offsets instead of only the first. Added in-place reverse-patch fallback to both bash and PowerShell revert scripts, triggered when no `.bak.<ts>` matches current binary size (different sub-build). Post-patch behavior corrected: schema validation reads disk binary per Agent spawn (no restart needed), and unknown model IDs silently fall back to parent-inherit instead of API-failing. Tested on macOS 2.1.132 (2-instance) and 2.1.133 (1-instance); Windows scripts updated symmetrically but not retested on Windows since 1.1.1. |
