@@ -13,7 +13,7 @@ if (!filePath) {
   process.exit(2);
 }
 
-const ANCHOR = '.enum(["sonnet","opus","haiku"])';
+const ANCHOR = '.enum(["sonnet","opus","haiku","fable"])';
 const MARKER = 'RTK-SUBAGENT-PATCH';
 const PRE = '.string().optional().describe("The type of specialized agent to use for this task"),model:';
 const POST = '.optional().describe("Optional model override for this agent.';
