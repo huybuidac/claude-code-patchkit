@@ -7,7 +7,7 @@ Unlock the `model` parameter on the Agent/Task tool from a fixed enum (`["sonnet
 | Field | Value |
 |-------|-------|
 | Author | @huybuidac |
-| Tested versions | 2.1.116, 2.1.119, 2.1.121, 2.1.132 (2-instance bundle, 32-byte 3-enum), 2.1.133 (1-instance bundle, 32-byte 3-enum), 2.1.170 (1-instance bundle, 40-byte 4-enum) on macOS; 2.1.x on Windows arm64 |
+| Tested versions | 2.1.116, 2.1.119, 2.1.121, 2.1.132 (2-instance bundle, 32-byte 3-enum), 2.1.133 (1-instance bundle, 32-byte 3-enum), 2.1.170 (1-instance bundle, 40-byte 4-enum, `"`-quoted post-guard), 2.1.176 (1-instance bundle, 40-byte 4-enum, backtick post-guard) on macOS; 2.1.x on Windows arm64 |
 | Risk level | low |
 | Reversible | yes (backup) |
 | Platforms | macOS (arm64/x86_64), Windows (arm64/x64) |
@@ -59,14 +59,19 @@ Note: on 2.1.170 the byte immediately before the anchor is the minified Zod alia
 
 **After** (must immediately follow anchor):
 ```
-.optional().describe("Optional model override for this agent.
+.optional().describe(<q>Optional model override for this agent.
 ```
+where `<q>` is the JS string-quote character that the minifier chose for the description:
+- **2.1.170–2.1.175**: a double-quote `"` → `.optional().describe("Optional model override for this agent.`
+- **≥ 2.1.176**: a **backtick** `` ` `` → `.optional().describe(\`Optional model override for this agent.` — Anthropic expanded the description (it now contains an apostrophe in *"agent definition's"* and an embedded `"fork"`), so the minifier emitted a template literal instead of a `"`-quoted string.
+
+The guard is therefore **quote-agnostic**: it checks the stable prefix `.optional().describe(` immediately after the anchor **and** the stable substring `Optional model override for this agent.` in the following bytes — it does NOT pin the quote character. This survives both the 2.1.176 quote flip and any future quote-style change.
 
 ### Stability notes
 
 - Anchor **content and length changed at 2.1.170** (added `"fable"`, 32 → 40 bytes). Byte-identical within each era: 116/119/121/132/133 share the 32-byte 3-enum; 2.1.170 uses the 40-byte 4-enum.
 - Zod alias variable is minified differently per version (`h.` vs `y.` vs `v.` vs `k.`) — we do NOT include it in the pattern.
-- Context guard uses string literals from `.describe()` calls which are stable across minification — these are unchanged across the 2.1.170 enum change, which is why the guard still validates.
+- Context guard uses string literals from `.describe()` calls which are stable across minification — the **text** is unchanged across the 2.1.170 enum change, which is why the guard still validates. At **2.1.176** the post-guard's surrounding *quote character* flipped from `"` to a backtick (description gained an apostrophe + embedded `"fork"`), so the guard was made quote-agnostic — it no longer matches the quote byte, only the stable prefix `.optional().describe(` and the stable text `Optional model override for this agent.`
 - **Bundle multiplicity is NOT stable** — Anthropic flipped macOS from 2-instance to 1-instance between 2.1.132 and 2.1.133 (still 1-instance at 2.1.170). Treat the count as observed, not fixed.
 
 ## Replacement
@@ -114,7 +119,7 @@ Generic — works for any bundle multiplicity (1 or 2 currently observed):
 Concretely as observed:
 - macOS ≤ 2.1.132: unpatched=`2/0`, patched=`0/2`
 - macOS 2.1.133–2.1.169: unpatched=`1/0`, patched=`0/1`
-- macOS ≥ 2.1.170: unpatched=`1/0`, patched=`0/1` (anchor is the 40-byte 4-enum)
+- macOS ≥ 2.1.170: unpatched=`1/0`, patched=`0/1` (anchor is the 40-byte 4-enum; post-guard quote is `"` on 2.1.170–2.1.175, backtick on ≥ 2.1.176 — anchor bytes unchanged either way)
 - Windows: unpatched=`1/0`, patched=`0/1`
 
 Detection one-liner — Unix (use the 40-byte anchor on 2.1.170+):
@@ -148,8 +153,11 @@ NEW='.string()/*RTK-SUBAGENT-PATCH*/         '   # 40 bytes (9 trailing spaces)
 MARKER='RTK-SUBAGENT-PATCH'
 
 # 1. Detect state — generic (works for any bundle count)
-EN=$(grep -ao -F "$OLD" "$BIN" | wc -l | tr -d ' ')
-PT=$(grep -ao -F "$MARKER" "$BIN" | wc -l | tr -d ' ')
+# `|| true`: grep exits 1 when a needle is absent (e.g. marker on an unpatched binary);
+# under `set -o pipefail` + `set -e` that would kill the script at the assignment before
+# the `if` ever runs. The assignment still captures wc's count; `|| true` just eats the status.
+EN=$(grep -ao -F "$OLD" "$BIN" | wc -l | tr -d ' ') || true
+PT=$(grep -ao -F "$MARKER" "$BIN" | wc -l | tr -d ' ') || true
 
 if   [ "$EN" -ge 1 ] && [ "$PT" -eq 0 ]; then
   echo "Status: unpatched (anchor=$EN) — proceeding"
@@ -167,16 +175,19 @@ data = pathlib.Path(sys.argv[1]).read_bytes()
 expect = int(sys.argv[2])
 old = b'.enum(["sonnet","opus","haiku","fable"])'
 pre = b'.string().optional().describe("The type of specialized agent to use for this task"),model:'
-post = b'.optional().describe("Optional model override for this agent.'
+# Quote-agnostic post-guard: the .describe() quote flipped "->backtick at 2.1.176.
+post_prefix = b'.optional().describe('
+post_desc   = b'Optional model override for this agent.'
 i = 0; hits = 0
 while True:
     j = data.find(old, i)
     if j < 0: break
     hits += 1
     ctx_before = data[max(0,j-100):j]
-    ctx_after  = data[j+len(old):j+len(old)+100]
+    ctx_after  = data[j+len(old):j+len(old)+120]
     assert pre in ctx_before, f"context-before mismatch at offset {j}"
-    assert ctx_after.startswith(post), f"context-after mismatch at offset {j}"
+    assert ctx_after.startswith(post_prefix), f"context-after prefix mismatch at offset {j}"
+    assert post_desc in ctx_after, f"context-after desc mismatch at offset {j}"
     i = j + 1
 assert hits == expect, f"expected {expect} occurrences, got {hits}"
 print(f"Context guard passed ({hits} anchor[s] verified)")
@@ -211,7 +222,7 @@ echo "Re-signed"
 codesign --verify "$BIN" 2>&1 || { echo "Codesign verify failed"; exit 1; }
 
 # 6. Self-verify — marker count should equal the original anchor count
-VERIFY=$(grep -ao -F "$MARKER" "$BIN" | wc -l | tr -d ' ')
+VERIFY=$(grep -ao -F "$MARKER" "$BIN" | wc -l | tr -d ' ') || true
 if [ "$VERIFY" -eq "$EXPECT" ]; then
   echo "Verified: patch applied successfully ($VERIFY marker[s])"
 else
@@ -344,7 +355,8 @@ NEW='.string()/*RTK-SUBAGENT-PATCH*/         '
 MARKER='RTK-SUBAGENT-PATCH'
 
 # 1. Verify currently patched (any marker count >= 1)
-PT=$(grep -ao -F "$MARKER" "$BIN" | wc -l | tr -d ' ')
+# `|| true` guards against grep's exit-1-on-no-match killing the script under set -e + pipefail.
+PT=$(grep -ao -F "$MARKER" "$BIN" | wc -l | tr -d ' ') || true
 [ "$PT" -lt 1 ] && echo "Binary is not patched (marker count: $PT)" && exit 1
 EXPECT="$PT"
 echo "Currently patched (marker count: $PT)"
@@ -392,9 +404,9 @@ codesign --remove-signature "$BIN" 2>/dev/null || true
 codesign --force --sign - "$BIN"
 codesign --verify "$BIN" 2>&1 || { echo "Codesign verify failed after revert"; exit 1; }
 
-# 4. Verify reverted — generic
-EN=$(grep -ao -F "$OLD" "$BIN" | wc -l | tr -d ' ')
-PT=$(grep -ao -F "$MARKER" "$BIN" | wc -l | tr -d ' ')
+# 4. Verify reverted — generic (|| true: marker is absent after a clean revert → grep exits 1)
+EN=$(grep -ao -F "$OLD" "$BIN" | wc -l | tr -d ' ') || true
+PT=$(grep -ao -F "$MARKER" "$BIN" | wc -l | tr -d ' ') || true
 if [ "$EN" -ge 1 ] && [ "$PT" -eq 0 ]; then
   echo "Reverted successfully (anchor=$EN marker=0)"
 else
@@ -509,7 +521,7 @@ if ($final.anchorCount -ge 1 -and $final.markerCount -eq 0) {
 
 ```bash
 grep -c -a -F 'RTK-SUBAGENT-PATCH' "$(which claude)"
-# Expected: 2 on macOS ≤ 2.1.132, 1 on macOS ≥ 2.1.133 (incl. 2.1.170), 1 on Linux (so far)
+# Expected: 2 on macOS ≤ 2.1.132, 1 on macOS ≥ 2.1.133 (incl. 2.1.170, 2.1.176), 1 on Linux (so far)
 ```
 
 ### Windows (PowerShell) — expects ≥ 1
@@ -543,7 +555,7 @@ Should succeed instead of failing schema validation.
 1. **macOS signing** — re-sign with ad-hoc codesign resolves it. May trigger Gatekeeper on first launch.
 2. **Windows signing** — Authenticode signature becomes `HashMismatch` after patching. Binary still runs; restart Claude Code to pick up the patched file.
 3. **Windows file lock** — patching uses rename-swap. The displaced original may stay on disk until the running process exits; clean up `*.replacing.*` files after restart if any remain.
-4. **Auto-update** — new Claude Code version = new binary. Re-apply per version. The anchor itself can change shape: 2.1.170 added `"fable"` to the enum, changing the anchor from 32 to 40 bytes. When a version stops matching, re-inspect the binary around `model:` / `"Optional model override for this agent."` to recover the current enum and rebuild the length-preserving replacement.
+4. **Auto-update** — new Claude Code version = new binary. Re-apply per version. The fingerprint can change shape in two independent ways: (a) the **anchor** — 2.1.170 added `"fable"` to the enum, changing it from 32 to 40 bytes; (b) the **context guard** — 2.1.176 left the anchor untouched but flipped the post-guard's `.describe()` quote from `"` to a backtick (the guard is now quote-agnostic to absorb this). When a version stops matching, re-inspect the binary around `model:` / `Optional model override for this agent.` to recover the current enum and rebuild the length-preserving replacement.
 5. **Backup rotation** — each apply creates a `.bak.<ts>` file (~210 MB). After confirming a new version works, delete older backups:
    - Windows: `Get-ChildItem "$env:USERPROFILE\.local\bin\claude.exe.bak.*" | Sort-Object LastWriteTime -Descending | Select-Object -Skip 2 | Remove-Item`
    - Unix: `ls -t "$BIN".bak.* | tail -n +3 | xargs -r rm`
@@ -559,4 +571,5 @@ Should succeed instead of failing schema validation.
 | 2026-05-08 | 1.1 | Windows port — single-instance bundle, rename-swap for file-lock, Node-based scanner, signature left invalid |
 | 2026-05-08 | 1.1.1 | Self-review fixes: Windows scripts self-contained, `[DateTimeOffset]` instead of `Get-Date -UFormat`, parallel Unix/Windows verification blocks, backup rotation hint |
 | 2026-06-10 | 1.3.0 | **2.1.170 anchor change.** Anthropic added a fourth model alias (`"fable"`) to the Task-tool enum, changing the anchor from `.enum(["sonnet","opus","haiku"])` (32 bytes) to `.enum(["sonnet","opus","haiku","fable"])` (40 bytes). Old anchor count dropped to 0 → previous patch no longer matched. Updated primary anchor, replacement (now `.string()/*RTK-SUBAGENT-PATCH*/` + 9 trailing spaces = 40 bytes), all bash/PowerShell length assertions (32→40), and `scan-bin.js` ANCHOR. Pre-2.1.170 3-enum kept as historical/fallback. Single-instance bundle, anchor count 1; context guard (`subagent_type...model:` before, `Optional model override` after) unchanged and still validates — note the byte before the anchor is now the minified Zod alias `k`. Verified end-to-end on macOS 2.1.170 arm64 (patch + ad-hoc codesign + marker self-verify). |
+| 2026-06-13 | 1.4.0 | **2.1.176 context-guard change (anchor unchanged).** The 40-byte 4-enum anchor and the length-preserving replacement are byte-identical to 2.1.170 (count 1, unpatched=`1/0`), so the patch/replacement bytes did not change. But Anthropic expanded the `model` field's `.describe()` text — it now reads *"Optional model override for this agent. Takes precedence over the agent definition's model frontmatter…"* and mentions `subagent_type: "fork"` — and because that text contains an apostrophe and an embedded `"`, the minifier emitted it as a **backtick template literal** instead of a `"`-quoted string. The old post-guard `.optional().describe("Optional model override…` no longer matched (`postMatch=false`), so both the bash Python guard and `scan-bin.js` would have aborted at the context-guard step. Fix: made the post-guard **quote-agnostic** — match the stable prefix `.optional().describe(` plus the stable substring `Optional model override for this agent.`, ignoring the quote byte. Updated `scan-bin.js` (`POST` → `POST_PREFIX`/`POST_DESC`), the bash guard, fingerprint docs, and caveat #4. **Also fixed a latent bash bug** surfaced during verification: the detection greps (`EN=$(grep …)`, `PT=$(grep …)`) had no `|| true`, so on a clean unpatched binary the marker grep returned exit 1, and `set -o pipefail` + `set -e` killed the script at the assignment *before the first echo* — detection never completed on any fresh binary. Added `|| true` to every count-grep assignment in both the apply and revert scripts (the assignment still captures `wc`'s count; `|| true` only swallows grep's no-match status). Verified end-to-end on macOS 2.1.176 arm64 (patch + ad-hoc codesign + marker self-verify). |
 | 2026-05-09 | 1.2.0 | Bundle count made dynamic on both platforms. macOS 2.1.133 switched from 2-instance to 1-instance bundle — old hard-coded `hits == 2` assertion would classify it as "abnormal" and abort. State detection now treats any positive anchor count as unpatched on both Unix and Windows; PowerShell apply loops over all anchor offsets instead of only the first. Added in-place reverse-patch fallback to both bash and PowerShell revert scripts, triggered when no `.bak.<ts>` matches current binary size (different sub-build). Post-patch behavior corrected: schema validation reads disk binary per Agent spawn (no restart needed), and unknown model IDs silently fall back to parent-inherit instead of API-failing. Tested on macOS 2.1.132 (2-instance) and 2.1.133 (1-instance); Windows scripts updated symmetrically but not retested on Windows since 1.1.1. |

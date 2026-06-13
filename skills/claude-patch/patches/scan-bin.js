@@ -16,7 +16,12 @@ if (!filePath) {
 const ANCHOR = '.enum(["sonnet","opus","haiku","fable"])';
 const MARKER = 'RTK-SUBAGENT-PATCH';
 const PRE = '.string().optional().describe("The type of specialized agent to use for this task"),model:';
-const POST = '.optional().describe("Optional model override for this agent.';
+// Post-guard is quote-agnostic: the .describe() call immediately after the anchor
+// switched from a "-quoted string (2.1.170–2.1.175) to a backtick template literal
+// at 2.1.176 (the description gained an apostrophe + embedded "fork"). Match the
+// stable prefix + stable description text instead of pinning the quote character.
+const POST_PREFIX = '.optional().describe(';
+const POST_DESC = 'Optional model override for this agent.';
 
 function findAll(filePath, needle) {
   const needleBuf = Buffer.from(needle, 'utf8');
@@ -61,7 +66,7 @@ const markerOffsets = findAll(filePath, MARKER);
 const contextGuards = anchorOffsets.map(off => {
   const before = readAt(filePath, Math.max(0, off - 200), Math.min(200, off)).toString('utf8');
   const after = readAt(filePath, off + ANCHOR.length, 200).toString('utf8');
-  return { offset: off, preMatch: before.includes(PRE), postMatch: after.startsWith(POST) };
+  return { offset: off, preMatch: before.includes(PRE), postMatch: after.startsWith(POST_PREFIX) && after.includes(POST_DESC) };
 });
 
 function classify(a, m) {
