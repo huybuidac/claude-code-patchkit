@@ -5,7 +5,7 @@ disable-model-invocation: true
 argument-hint: "apply|revert|status|list [patch-name]"
 metadata:
   author: huybuidac
-  version: "1.2.0"
+  version: "1.5.0"
   compatibility: "macOS/Linux (arm64/x86_64) with codesign (macOS) + python3, OR Windows 10/11 (arm64/x64) with PowerShell 5.1+ and Node.js (required for binary scanner)."
 ---
 
