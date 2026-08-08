@@ -1,27 +1,85 @@
 #!/usr/bin/env node
 // scan-bin.js — find byte patterns in Claude Code binary (any size, streaming)
-// Usage: node scan-bin.js <path-to-binary> [--json]
+// Usage: node scan-bin.js <path-to-binary> [--patch <id>] [--json]
 // Used by both Windows and Unix workflows when grep/python aren't suitable.
 
 const fs = require('fs');
 
+const PATCHES = {
+  'subagent-model': {
+    // 2.1.224+: call-form anchor (`xr(...)`), 37 bytes. Aliases `xr`/`N` are ordinary minified
+    // identifiers, not stable literal text like the old `.enum(`/`.string()` method names — if
+    // this stops matching on a future version, re-derive both aliases (see subagent-model.md
+    // "Auto-update" caveat) by searching for "Optional model override for this agent." and
+    // reading the call immediately before it and before `.optional().describe(`.
+    anchor: 'xr(["sonnet","opus","haiku","fable"])',
+    marker: 'RTK-SUBAGENT-PATCH',
+    guard: {
+      beforeBytes: 200,
+      afterBytes: 200,
+      beforeAll: ['N().optional().describe("The type of specialized agent to use for this task"),model:'],
+      // Quote-agnostic: the description changed from a quoted string to a
+      // template literal at 2.1.176, while its prefix and text stayed stable.
+      afterPrefix: '.optional().describe(',
+      afterAll: ['Optional model override for this agent.'],
+    },
+  },
+  'auto-compact-by-model': {
+    anchor: 'if(process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW){let l=ODe("CLAUDE_CODE_AUTO_COMPACT_WINDOW",process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW,bZn,DJi);if(l.status!=="invalid"){let c=Math.max(bZn,l.effective);return{window:Math.min(o,c),configured:c,source:"env"}}}',
+    marker: 'RTK-AUTOCOMPACT-PATCH',
+    guard: {
+      beforeBytes: 0,
+      afterBytes: 700,
+      beforeAll: [],
+      afterAll: [
+        'source:"settings"',
+        'source:"clientdata"',
+        'source:"experiment"',
+        'source:"model-default"',
+        'source:"auto"',
+      ],
+    },
+  },
+};
+
 const args = process.argv.slice(2);
-const jsonOutput = args.includes('--json');
-const filePath = args.filter(a => !a.startsWith('--'))[0];
+let filePath;
+let patchId = 'subagent-model';
+let jsonOutput = false;
+
+for (let i = 0; i < args.length; i++) {
+  const arg = args[i];
+  if (arg === '--json') {
+    jsonOutput = true;
+  } else if (arg === '--patch') {
+    patchId = args[++i];
+    if (!patchId) {
+      console.error('--patch requires a patch id');
+      process.exit(2);
+    }
+  } else if (arg.startsWith('--patch=')) {
+    patchId = arg.slice('--patch='.length);
+  } else if (arg.startsWith('--')) {
+    console.error(`Unknown option: ${arg}`);
+    process.exit(2);
+  } else if (!filePath) {
+    filePath = arg;
+  } else {
+    console.error(`Unexpected argument: ${arg}`);
+    process.exit(2);
+  }
+}
+
 if (!filePath) {
-  console.error('Usage: node scan-bin.js <path-to-binary> [--json]');
+  console.error('Usage: node scan-bin.js <path-to-binary> [--patch <id>] [--json]');
   process.exit(2);
 }
 
-const ANCHOR = '.enum(["sonnet","opus","haiku","fable"])';
-const MARKER = 'RTK-SUBAGENT-PATCH';
-const PRE = '.string().optional().describe("The type of specialized agent to use for this task"),model:';
-// Post-guard is quote-agnostic: the .describe() call immediately after the anchor
-// switched from a "-quoted string (2.1.170–2.1.175) to a backtick template literal
-// at 2.1.176 (the description gained an apostrophe + embedded "fork"). Match the
-// stable prefix + stable description text instead of pinning the quote character.
-const POST_PREFIX = '.optional().describe(';
-const POST_DESC = 'Optional model override for this agent.';
+const patch = PATCHES[patchId];
+if (!patch) {
+  console.error(`Unknown patch: ${patchId}. Available: ${Object.keys(PATCHES).join(', ')}`);
+  process.exit(2);
+}
 
 function findAll(filePath, needle) {
   const needleBuf = Buffer.from(needle, 'utf8');
@@ -60,13 +118,22 @@ function readAt(filePath, offset, length) {
   return buf.subarray(0, n);
 }
 
-const anchorOffsets = findAll(filePath, ANCHOR);
-const markerOffsets = findAll(filePath, MARKER);
+function includesAll(text, needles = []) {
+  return needles.every(needle => text.includes(needle));
+}
+
+const anchorOffsets = findAll(filePath, patch.anchor);
+const markerOffsets = findAll(filePath, patch.marker);
+const guard = patch.guard || {};
 
 const contextGuards = anchorOffsets.map(off => {
-  const before = readAt(filePath, Math.max(0, off - 200), Math.min(200, off)).toString('utf8');
-  const after = readAt(filePath, off + ANCHOR.length, 200).toString('utf8');
-  return { offset: off, preMatch: before.includes(PRE), postMatch: after.startsWith(POST_PREFIX) && after.includes(POST_DESC) };
+  const beforeBytes = guard.beforeBytes || 0;
+  const afterBytes = guard.afterBytes || 0;
+  const before = readAt(filePath, Math.max(0, off - beforeBytes), Math.min(beforeBytes, off)).toString('utf8');
+  const after = readAt(filePath, off + patch.anchor.length, afterBytes).toString('utf8');
+  const preMatch = includesAll(before, guard.beforeAll);
+  const postMatch = (!guard.afterPrefix || after.startsWith(guard.afterPrefix)) && includesAll(after, guard.afterAll);
+  return { offset: off, preMatch, postMatch };
 });
 
 function classify(a, m) {
@@ -78,8 +145,9 @@ function classify(a, m) {
 const result = {
   file: filePath,
   size: fs.statSync(filePath).size,
-  anchor: ANCHOR,
-  marker: MARKER,
+  patch: patchId,
+  anchor: patch.anchor,
+  marker: patch.marker,
   anchorCount: anchorOffsets.length,
   markerCount: markerOffsets.length,
   anchorOffsets,
@@ -92,6 +160,7 @@ if (jsonOutput) {
   console.log(JSON.stringify(result, null, 2));
 } else {
   console.log(`File: ${result.file} (${(result.size / 1024 / 1024).toFixed(1)} MB)`);
+  console.log(`Patch: ${result.patch}`);
   console.log(`State: ${result.state}`);
   console.log(`Anchor count: ${result.anchorCount}`);
   console.log(`Marker count: ${result.markerCount}`);

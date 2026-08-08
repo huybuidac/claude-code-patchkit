@@ -5,7 +5,7 @@ disable-model-invocation: true
 argument-hint: "apply|revert|status|list [patch-name]"
 metadata:
   author: huybuidac
-  version: "1.5.0"
+  version: "1.6.0"
   compatibility: "macOS/Linux (arm64/x86_64) with codesign (macOS) + python3, OR Windows 10/11 (arm64/x64) with PowerShell 5.1+ and Node.js (required for binary scanner)."
 ---
 
@@ -65,6 +65,7 @@ Available patches — read each `.md` file in [patches/](patches/) directory:
 | Patch | Description |
 |-------|-------------|
 | [subagent-model](patches/subagent-model.md) | Unlock `model` param on Agent tool — use any model id per-call |
+| [auto-compact-by-model](patches/auto-compact-by-model.md) | Use model-aware extended-context compact targets (Claude ≈400K, GPT ≈300K) |
 
 Commands:
 - `apply <patch-name>` — apply a patch
@@ -80,6 +81,8 @@ Read the patch definition file at `${CLAUDE_SKILL_DIR}/patches/<name>.md`. Each 
 - Replacement (length-preserving byte swap)
 - State detection logic
 - Verification steps
+
+When a patch uses the shared Node scanner, select it explicitly with `scan-bin.js <binary> --patch <name> --json`. Omitting `--patch` remains backward-compatible and selects `subagent-model`.
 
 ## Safety rules
 
@@ -131,10 +134,10 @@ When reverting a patch:
 2. **Show timestamps and sizes** and let user pick which backup to restore.
 3. **Confirm current binary is patched** before reverting — check marker count > 0.
 4. **Choose revert mode**:
-   - **Backup restore (preferred)** — only if backup file size matches current binary size (same sub-build). Claude Code occasionally re-bundles within the same dot-version, leaving stale `.bak` files on disk that no longer match.
+   - **Backup restore (preferred)** — normally only if backup file size matches current binary size (same sub-build). A patch definition may explicitly allow a macOS signature-size mismatch when it additionally verifies the same Claude version and the patch's unpatched fingerprint. Claude Code occasionally re-bundles within the same dot-version, so never restore by filename alone.
      - Unix: `cp "$BACKUP" "$CLAUDE_BIN"`
      - Windows: same rename-swap pattern as for apply (running `claude.exe` is locked)
-   - **In-place reverse-patch (fallback)** — when no size-matching backup exists. Write the original 32-byte enum back over the marker. Length-preserving, doesn't depend on backup integrity. See each patch definition for the exact reverse procedure.
+   - **In-place reverse-patch (fallback)** — when no validated backup exists. Write the patch's original bytes back over its exact marker-bearing replacement. Length-preserving and independent of backup integrity; see each patch definition for the exact reverse procedure.
 5. **Always make a safety snapshot** (`<binary>.preRevert.<ts>`) of the current patched binary before any write, so the revert itself is undoable.
 6. **Re-sign (macOS only)**:
    ```bash

@@ -7,7 +7,7 @@ Unlock the `model` parameter on the Agent/Task tool from a fixed enum (`["sonnet
 | Field | Value |
 |-------|-------|
 | Author | @huybuidac |
-| Tested versions | 2.1.116, 2.1.119, 2.1.121, 2.1.132 (2-instance bundle, 32-byte 3-enum), 2.1.133 (1-instance bundle, 32-byte 3-enum), 2.1.170 (1-instance bundle, 40-byte 4-enum, `"`-quoted post-guard), 2.1.176 (1-instance bundle, 40-byte 4-enum, backtick post-guard), 2.1.198 / 2.1.201 (1-instance bundle, 40-byte 4-enum, backtick post-guard — byte-identical to 2.1.176) on macOS; 2.1.x on Windows arm64 |
+| Tested versions | 2.1.116, 2.1.119, 2.1.121, 2.1.132 (2-instance bundle, 32-byte 3-enum), 2.1.133 (1-instance bundle, 32-byte 3-enum), 2.1.170 (1-instance bundle, 40-byte 4-enum, `"`-quoted post-guard), 2.1.176 (1-instance bundle, 40-byte 4-enum, backtick post-guard), 2.1.198 / 2.1.201 / 2.1.210 (1-instance bundle, 40-byte 4-enum, backtick post-guard — byte-identical to 2.1.176), 2.1.224 (1-instance bundle, **37-byte call-form anchor**, see below) on macOS; 2.1.x on Windows arm64 |
 | Risk level | low |
 | Reversible | yes (backup) |
 | Platforms | macOS (arm64/x86_64), Windows (arm64/x64) |
@@ -50,9 +50,20 @@ Key point: `Ya` reads the **org policy `availableModels` allowlist**, which is e
 
 ## Fingerprint
 
-> **Anchor changed at 2.1.170.** Anthropic added a fourth model alias (`"fable"`) to the enum. This changes BOTH the anchor bytes AND its length (32 → 40), so the replacement string changes too. The skill ships the 2.1.170+ anchor as primary; the pre-2.1.170 3-enum is documented below as historical.
+> **Anchor changed at 2.1.170 (content) and again at 2.1.224 (call form).** 2.1.170 added a fourth model alias (`"fable"`) to the enum (32 → 40 bytes). 2.1.224 changed the *calling convention* — Zod method-chain calls (`X.enum([...])`, `X.string()`) became direct destructured-function calls (`xr([...])`, `N()`), with no content change to the alias list. The skill ships the 2.1.224 anchor as primary; 2.1.170–2.1.223 and pre-2.1.170 forms are documented below as historical.
 
-### Anchor pattern — ≥ 2.1.170 (40 bytes, current)
+### Anchor pattern — ≥ 2.1.224 (37 bytes, current)
+
+```
+xr(["sonnet","opus","haiku","fable"])
+```
+
+- Length: **37 bytes**
+- Observed count on 2.1.224 macOS arm64: **1** (single bundle embed)
+- `xr` is a minified alias for a destructured top-level Zod enum-factory function (not a method off a shared namespace object — e.g. `const {enum: xr, string: N, ...} = z` pattern, consistent with Zod's tree-shakable function-style API). The alias letters are expected to drift per build like every other minified identifier in this codebase — don't hardcode `xr`/`N` as stable across versions, re-derive per the "Auto-update" caveat.
+- The sibling `subagent_type` field's `.string()` call went through the same transform, from `.string()` to a bare `N()` call, **in the same statement** immediately before `model:`. This is the load-bearing fact for the replacement below: `N` is already proven to be a valid zero-arg "unconstrained string schema" factory in the exact same lexical scope, so `N()` is a safe drop-in for the removed enum constraint — no need to locate a separate `.string()` alias.
+
+### Anchor pattern — 2.1.170–2.1.223 (40 bytes, historical)
 
 ```
 .enum(["sonnet","opus","haiku","fable"])
@@ -60,6 +71,7 @@ Key point: `Ya` reads the **org policy `availableModels` allowlist**, which is e
 
 - Length: **40 bytes**
 - Observed count on 2.1.170 macOS arm64: **1** (single bundle embed)
+- No longer present ≥ 2.1.224 (superseded by the call-form anchor above).
 
 ### Anchor pattern — ≤ 2.1.169 (32 bytes, historical)
 
@@ -81,11 +93,18 @@ Key point: `Ya` reads the **org policy `availableModels` allowlist**, which is e
 
 Verify surrounding bytes to confirm this is the Task tool schema, not one of the other `["sonnet","opus","haiku","fable"]` arrays in the binary (on 2.1.170 the bare 4-element array appears 4×, but only one is wrapped in `.enum(...)` and only one has this context):
 
-**Before** (must appear within 100 bytes preceding anchor):
-```
-.string().optional().describe("The type of specialized agent to use for this task"),model:
-```
-Note: the byte immediately before the anchor is the minified Zod alias, which varies per build (`k` on 2.1.170/2.1.176, `E` on 2.1.201), i.e. the live text is `...,model:E.enum(...)` on 2.1.201. The guard string ends at `model:` and is matched as a substring, so the alias char does not affect it.
+**Before** (must appear within 100–120 bytes preceding anchor):
+
+- **2.1.170–2.1.223** (method-chain form):
+  ```
+  .string().optional().describe("The type of specialized agent to use for this task"),model:
+  ```
+  Note: the byte immediately before the anchor is the minified Zod alias, which varies per build (`k` on 2.1.170/2.1.176, `E` on 2.1.201, `v` on 2.1.210), i.e. the live text is `...,model:v.enum(...)` on 2.1.210. The guard string ends at `model:` and is matched as a substring, so the alias char does not affect it.
+- **≥ 2.1.224** (call form):
+  ```
+  N().optional().describe("The type of specialized agent to use for this task"),model:
+  ```
+  `N` is the minified alias for the destructured `string` factory in this build (verified 2.1.224 macOS arm64) — expect this letter to drift per build like `xr` does; re-derive both aliases together (they always appear in the same statement) rather than hardcoding.
 
 **After** (must immediately follow anchor):
 ```
@@ -106,7 +125,20 @@ The guard is therefore **quote-agnostic**: it checks the stable prefix `.optiona
 
 ## Replacement
 
-### ≥ 2.1.170 (40 bytes, current)
+### ≥ 2.1.224 (37 bytes, current)
+
+| Old (37 bytes) | New (37 bytes) |
+|---|---|
+| `xr(["sonnet","opus","haiku","fable"])` | `N()/*RTK-SUBAGENT-PATCH*/            ` |
+
+Breakdown:
+- `N()` (3 bytes) — the build's destructured string-schema factory, called with no args; removes the enum constraint, accepts any string. **Re-derive `N` per build** the same way `xr` was derived (see Fingerprint section) — don't assume the letter is stable.
+- `/*RTK-SUBAGENT-PATCH*/` (22 bytes) — JS comment serving as detection marker
+- `            ` (12 trailing spaces) — padding to preserve length
+
+Length-preserving: both old and new are exactly 37 bytes.
+
+### 2.1.170–2.1.223 (40 bytes, historical)
 
 | Old (40 bytes) | New (40 bytes) |
 |---|---|
@@ -125,7 +157,7 @@ Length-preserving: both old and new are exactly 40 bytes.
 |---|---|
 | `.enum(["sonnet","opus","haiku"])` | `.string()/*RTK-SUBAGENT-PATCH*/ ` |
 
-Same marker, 1 trailing space (32-byte total). The marker string is identical across both eras — only the padding width differs — so detection (`grep RTK-SUBAGENT-PATCH`) works regardless of which era patched the binary.
+Same marker, 1 trailing space (32-byte total). The marker string is identical across all three eras — only the padding width differs (1 / 9 / 12 spaces for the 32 / 40 / 37-byte anchors respectively) — so detection (`grep RTK-SUBAGENT-PATCH`) works regardless of which era patched the binary.
 
 ### Patch marker
 
@@ -149,14 +181,16 @@ Generic — works for any bundle multiplicity (1 or 2 currently observed):
 Concretely as observed:
 - macOS ≤ 2.1.132: unpatched=`2/0`, patched=`0/2`
 - macOS 2.1.133–2.1.169: unpatched=`1/0`, patched=`0/1`
-- macOS ≥ 2.1.170: unpatched=`1/0`, patched=`0/1` (anchor is the 40-byte 4-enum; post-guard quote is `"` on 2.1.170–2.1.175, backtick on ≥ 2.1.176 — anchor bytes unchanged either way; verified byte-identical through 2.1.198 and 2.1.201)
+- macOS 2.1.170–2.1.223: unpatched=`1/0`, patched=`0/1` (anchor is the 40-byte 4-enum method-chain form `.enum([...])`; post-guard quote is `"` on 2.1.170–2.1.175, backtick on ≥ 2.1.176 — anchor bytes unchanged either way; verified byte-identical through 2.1.198, 2.1.201, and 2.1.210)
+- macOS ≥ 2.1.224: unpatched=`1/0`, patched=`0/1` (anchor is the **37-byte call-form** `xr([...])` — the 40-byte `.enum([...])` anchor reads **0** here, so check the 37-byte form first or state detection will misreport "abnormal, anchor missing")
 - Windows: unpatched=`1/0`, patched=`0/1`
 
-Detection one-liner — Unix (use the 40-byte anchor on 2.1.170+):
+Detection one-liner — Unix (use the 37-byte anchor on 2.1.224+; fall back to the 40-byte 4-enum for 2.1.170–2.1.223 if it reads 0):
 ```bash
-EN=$(grep -ao -F '.enum(["sonnet","opus","haiku","fable"])' "$BIN" | wc -l | tr -d ' ')
+EN=$(grep -ao -F 'xr(["sonnet","opus","haiku","fable"])' "$BIN" | wc -l | tr -d ' ')
 PT=$(grep -ao -F 'RTK-SUBAGENT-PATCH' "$BIN" | wc -l | tr -d ' ')
 ```
+If `EN` reads 0 on an unpatched binary, the minified alias may no longer be `xr` for this build — re-derive it per the "Auto-update" caveat (search for `Optional model override for this agent.` and read the call immediately before `.optional().describe(`) rather than assuming this exact 3-letter alias is stable.
 
 Detection — Windows (uses bundled Node scanner):
 ```powershell
@@ -176,10 +210,16 @@ set -euo pipefail
 
 BIN="${1:?Usage: $0 <path-to-claude-binary>}"
 
-# 2.1.170+ anchor (40 bytes). For ≤ 2.1.169 use the 32-byte 3-enum:
-#   OLD='.enum(["sonnet","opus","haiku"])'   NEW='.string()/*RTK-SUBAGENT-PATCH*/ '
-OLD='.enum(["sonnet","opus","haiku","fable"])'
-NEW='.string()/*RTK-SUBAGENT-PATCH*/         '   # 40 bytes (9 trailing spaces)
+# 2.1.224+ anchor (37 bytes, call-form). The alias `xr`/`N` are minified identifiers verified
+# on 2.1.224 macOS arm64 — they are NOT guaranteed stable across future versions the way the
+# old `.enum(`/`.string()` method names were. If EN reads 0 below, re-derive both aliases first
+# (see "Auto-update" caveat) before falling back to an older anchor.
+# For 2.1.170-2.1.223 use the 40-byte method-chain form:
+#   OLD='.enum(["sonnet","opus","haiku","fable"])'  NEW='.string()/*RTK-SUBAGENT-PATCH*/         '  (40 bytes)
+# For <= 2.1.169 use the 32-byte 3-enum:
+#   OLD='.enum(["sonnet","opus","haiku"])'           NEW='.string()/*RTK-SUBAGENT-PATCH*/ '          (32 bytes)
+OLD='xr(["sonnet","opus","haiku","fable"])'
+NEW='N()/*RTK-SUBAGENT-PATCH*/            '   # 37 bytes (12 trailing spaces)
 MARKER='RTK-SUBAGENT-PATCH'
 
 # 1. Detect state — generic (works for any bundle count)
@@ -203,8 +243,8 @@ python3 - "$BIN" "$EXPECT" <<'PY'
 import sys, pathlib
 data = pathlib.Path(sys.argv[1]).read_bytes()
 expect = int(sys.argv[2])
-old = b'.enum(["sonnet","opus","haiku","fable"])'
-pre = b'.string().optional().describe("The type of specialized agent to use for this task"),model:'
+old = b'xr(["sonnet","opus","haiku","fable"])'
+pre = b'N().optional().describe("The type of specialized agent to use for this task"),model:'
 # Quote-agnostic post-guard: the .describe() quote flipped "->backtick at 2.1.176.
 post_prefix = b'.optional().describe('
 post_desc   = b'Optional model override for this agent.'
@@ -213,8 +253,8 @@ while True:
     j = data.find(old, i)
     if j < 0: break
     hits += 1
-    ctx_before = data[max(0,j-100):j]
-    ctx_after  = data[j+len(old):j+len(old)+120]
+    ctx_before = data[max(0,j-120):j]
+    ctx_after  = data[j+len(old):j+len(old)+140]
     assert pre in ctx_before, f"context-before mismatch at offset {j}"
     assert ctx_after.startswith(post_prefix), f"context-after prefix mismatch at offset {j}"
     assert post_desc in ctx_after, f"context-after desc mismatch at offset {j}"
@@ -235,9 +275,9 @@ import sys, pathlib
 p = pathlib.Path(sys.argv[1])
 expect = int(sys.argv[2])
 data = p.read_bytes()
-old = b'.enum(["sonnet","opus","haiku","fable"])'
-new = b'.string()/*RTK-SUBAGENT-PATCH*/         '
-assert len(old) == len(new) == 40
+old = b'xr(["sonnet","opus","haiku","fable"])'
+new = b'N()/*RTK-SUBAGENT-PATCH*/            '
+assert len(old) == len(new) == 37
 hits = data.count(old)
 assert hits == expect, f"anchor count changed between detect and patch ({hits} vs {expect})"
 data = data.replace(old, new)
@@ -551,7 +591,7 @@ if ($final.anchorCount -ge 1 -and $final.markerCount -eq 0) {
 
 ```bash
 grep -c -a -F 'RTK-SUBAGENT-PATCH' "$(which claude)"
-# Expected: 2 on macOS ≤ 2.1.132, 1 on macOS ≥ 2.1.133 (incl. 2.1.170, 2.1.176, 2.1.198, 2.1.201), 1 on Linux (so far)
+# Expected: 2 on macOS ≤ 2.1.132, 1 on macOS ≥ 2.1.133 (incl. 2.1.170, 2.1.176, 2.1.198, 2.1.201, 2.1.210), 1 on Linux (so far)
 ```
 
 ### Windows (PowerShell) — expects ≥ 1
@@ -602,5 +642,7 @@ Should succeed instead of failing schema validation.
 | 2026-05-08 | 1.1.1 | Self-review fixes: Windows scripts self-contained, `[DateTimeOffset]` instead of `Get-Date -UFormat`, parallel Unix/Windows verification blocks, backup rotation hint |
 | 2026-06-10 | 1.3.0 | **2.1.170 anchor change.** Anthropic added a fourth model alias (`"fable"`) to the Task-tool enum, changing the anchor from `.enum(["sonnet","opus","haiku"])` (32 bytes) to `.enum(["sonnet","opus","haiku","fable"])` (40 bytes). Old anchor count dropped to 0 → previous patch no longer matched. Updated primary anchor, replacement (now `.string()/*RTK-SUBAGENT-PATCH*/` + 9 trailing spaces = 40 bytes), all bash/PowerShell length assertions (32→40), and `scan-bin.js` ANCHOR. Pre-2.1.170 3-enum kept as historical/fallback. Single-instance bundle, anchor count 1; context guard (`subagent_type...model:` before, `Optional model override` after) unchanged and still validates — note the byte before the anchor is now the minified Zod alias `k`. Verified end-to-end on macOS 2.1.170 arm64 (patch + ad-hoc codesign + marker self-verify). |
 | 2026-06-13 | 1.4.0 | **2.1.176 context-guard change (anchor unchanged).** The 40-byte 4-enum anchor and the length-preserving replacement are byte-identical to 2.1.170 (count 1, unpatched=`1/0`), so the patch/replacement bytes did not change. But Anthropic expanded the `model` field's `.describe()` text — it now reads *"Optional model override for this agent. Takes precedence over the agent definition's model frontmatter…"* and mentions `subagent_type: "fork"` — and because that text contains an apostrophe and an embedded `"`, the minifier emitted it as a **backtick template literal** instead of a `"`-quoted string. The old post-guard `.optional().describe("Optional model override…` no longer matched (`postMatch=false`), so both the bash Python guard and `scan-bin.js` would have aborted at the context-guard step. Fix: made the post-guard **quote-agnostic** — match the stable prefix `.optional().describe(` plus the stable substring `Optional model override for this agent.`, ignoring the quote byte. Updated `scan-bin.js` (`POST` → `POST_PREFIX`/`POST_DESC`), the bash guard, fingerprint docs, and caveat #4. **Also fixed a latent bash bug** surfaced during verification: the detection greps (`EN=$(grep …)`, `PT=$(grep …)`) had no `|| true`, so on a clean unpatched binary the marker grep returned exit 1, and `set -o pipefail` + `set -e` killed the script at the assignment *before the first echo* — detection never completed on any fresh binary. Added `|| true` to every count-grep assignment in both the apply and revert scripts (the assignment still captures `wc`'s count; `|| true` only swallows grep's no-match status). Verified end-to-end on macOS 2.1.176 arm64 (patch + ad-hoc codesign + marker self-verify). |
+| 2026-07-15 | 1.5.1 | **2.1.210 verified — no drift.** Applied end-to-end on macOS 2.1.210 arm64. The patch region is **byte-identical to 2.1.176/198/201**: 40-byte 4-enum anchor, count 1, backtick `.describe()` post-guard, pre-guard unchanged. Fresh (auto-updated) binary state was anchor `1` / marker `0` (unpatched); patch + ad-hoc codesign + marker self-verify succeeded (final anchor `0` / marker `1`, `codesign --verify` valid, binary runs). Only drift is cosmetic: the minified Zod alias before the anchor is now `v` (was `E` on 2.1.201, `k` on 2.1.170/176) — the guard ends at `model:` and ignores it, so no script/byte change. No new tool or system-prompt model gate observed. Docs-only update (tested versions, alias note, verification comment). |
 | 2026-07-07 | 1.5.0 | **2.1.201 analyzed — no drift, no new gate.** Investigated the latest bundle after Claude began warning *"gpt-5.5 isn't reachable from this session's Agent tooling"*, to check for an added tool or system-prompt model check. Result: the anchor, replacement, and both context guards are **byte-identical to 2.1.176** (40-byte 4-enum, count 1, backtick `.describe()`); the guard passes and the patch applies unchanged. The warning is caused by the binary being **unpatched after an auto-update** (fresh 2.1.201 = anchor 1 / marker 0) — Claude reads the intact enum from the tool schema and paraphrases it; there is **no** hard-coded `Agent tooling`/`isn't reachable` string (grep = 0). Cataloged every model gate: the Agent-tool `.enum(...)` is the **only** per-call gate (the other three 4-alias sites are the `vxd` constant + two `/model`-picker label maps `der`/`UMo`); the session-level validators `Ya` (org `availableModels` allowlist), `GJt` (server probe), and `Osa`/`restrictedModel` (startup) are a **separate path** for `--model`/`/model`/advisor and do not touch the Agent tool. Added a "Scope" section documenting all of this. Minified Zod alias before the anchor is now `E` (was `k`). No script/byte changes. Also confirms 2.1.198 (verified 2026-07-02). |
 | 2026-05-09 | 1.2.0 | Bundle count made dynamic on both platforms. macOS 2.1.133 switched from 2-instance to 1-instance bundle — old hard-coded `hits == 2` assertion would classify it as "abnormal" and abort. State detection now treats any positive anchor count as unpatched on both Unix and Windows; PowerShell apply loops over all anchor offsets instead of only the first. Added in-place reverse-patch fallback to both bash and PowerShell revert scripts, triggered when no `.bak.<ts>` matches current binary size (different sub-build). Post-patch behavior corrected: schema validation reads disk binary per Agent spawn (no restart needed), and unknown model IDs silently fall back to parent-inherit instead of API-failing. Tested on macOS 2.1.132 (2-instance) and 2.1.133 (1-instance); Windows scripts updated symmetrically but not retested on Windows since 1.1.1. |
+| 2026-08-08 | 1.6.0 | **2.1.224 anchor change — call-form, not content.** State detection on a fresh 2.1.224 macOS arm64 binary read `anchor=0 marker=0` against the 2.1.170+ anchor — a genuine "abnormal, fingerprint changed" per the state table, so the script aborted rather than patching blind. Investigation: the `["sonnet","opus","haiku","fable"]` alias list itself is unchanged (still 4 bare-array sites total, still exactly 1 gate), but the surrounding Zod call syntax flipped from method-chain (`X.enum([...])`, `X.string()`) to direct destructured-function calls (`xr([...])`, `N()`) — consistent with a Zod tree-shakable-API style change. Confirmed via the adjacent `subagent_type` field in the same statement: `subagent_type:N().optional().describe(...),model:xr(["sonnet","opus","haiku","fable"]).optional().describe(...)` — `N` already proven to be the string-schema factory in this exact scope, so `N()` is a safe drop-in replacement (no separate lookup needed). New anchor `xr(["sonnet","opus","haiku","fable"])` is 37 bytes (down from 40, since the call form is shorter than `.enum(`); replacement `N()/*RTK-SUBAGENT-PATCH*/` + 12 trailing spaces, also 37 bytes. Count 1, context guards updated (pre-guard now ends `N().optional().describe(...),model:`, post-guard unchanged/quote-agnostic). Applied end-to-end on macOS 2.1.224 arm64: backup + patch + ad-hoc codesign + marker self-verify succeeded (final anchor 0 / marker 1). **Caveat added**: unlike the old `.enum`/`.string()` method names, which were stable literal text, the call-form aliases (`xr`, `N`) are ordinary minified identifiers and should be expected to drift per build — re-derive them by searching for `Optional model override for this agent.` rather than assuming these exact letters persist. 2.1.170–2.1.223 method-chain form kept as historical/fallback. |

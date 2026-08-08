@@ -45,10 +45,11 @@ npx skills add huybuidac/claude-code-patchkit -g
 Inside a Claude Code session:
 
 ```
-/claude-patch                          # Interactive mode
-/claude-patch apply subagent-model     # Apply specific patch
-/claude-patch revert subagent-model    # Revert to backup
-/claude-patch status                   # Show all patch states
+/claude-patch                               # Interactive mode
+/claude-patch apply subagent-model          # Apply specific patch
+/claude-patch apply auto-compact-by-model   # Claude ≈400K, GPT ≈300K
+/claude-patch revert subagent-model         # Revert to backup
+/claude-patch status                        # Show all patch states
 ```
 
 ## Available Patches
@@ -56,6 +57,18 @@ Inside a Claude Code session:
 | Patch | Description | Risk |
 |-------|-------------|------|
 | [subagent-model](skills/claude-patch/patches/subagent-model.md) | Unlock `model` param on Agent tool — use any model id per-call | Low |
+| [auto-compact-by-model](skills/claude-patch/patches/auto-compact-by-model.md) | Model-aware extended-context compact targets: Claude ≈400K, GPT ≈300K | Medium |
+
+### Model-aware auto-compaction
+
+The `auto-compact-by-model` patch targets Claude Code 2.1.208's central compaction resolver. For models whose resolved context ceiling is above 200K, it sets internal windows that normally trigger at approximately:
+
+- `claude-*`: **400K actual context tokens**
+- `gpt-*`: **300K actual context tokens**
+
+A numeric `CLAUDE_CODE_AUTO_COMPACT_WINDOW` remains the fallback for other models. Matched extended-context Claude/GPT rules take precedence, so an existing global value can stay configured for standard or unknown model families. `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` may still compact earlier.
+
+The patch always creates `<binary>.bak.<timestamp>`, supports reverse-patch recovery when no matching backup exists, and requires a Claude Code restart because running processes keep the old executable mapped.
 
 ## How It Works
 
@@ -114,7 +127,7 @@ Claude Code is distributed as a bun-compiled binary with embedded JS bundles. So
 - **macOS / Linux**: `cp <binary>.bak.<timestamp> <binary> && codesign --force --sign - <binary>` (skip `codesign` on Linux)
 - **Windows**: stop Claude Code, then use rename-swap — `Rename-Item claude.exe claude.exe.broken; Move-Item claude.exe.bak.<ts> claude.exe`. The backup retains the original Authenticode signature.
 - Clean up Windows `*.replacing.*` files after Claude Code has exited (they may stay on disk while the old process is still mapped)
-- **If your `.bak` size doesn't match the current binary** (Claude Code re-bundled within the same version), don't restore — the `/claude-patch revert` flow will detect this and offer in-place reverse-patch instead.
+- **If your `.bak` size doesn't match the current binary**, use the patch-specific revert flow rather than copying blindly. Most patches require equal size; macOS patches that replace Anthropic's signature may instead validate the same Claude version plus the patch's unpatched fingerprint before restoring. Otherwise they fall back to an in-place reverse-patch.
 - To reinstall Claude Code: delete the install dir (`~/.local/share/claude/` on Unix, `%USERPROFILE%\.local\bin\claude.exe` on Windows) and re-run the installer
 
 ## License
