@@ -26,19 +26,11 @@ npx skills add huybuidac/claude-code-patchkit -g
 
 ## Prerequisites
 
-**macOS / Linux:**
-- macOS arm64 (tested) or x86_64 (expected to work); Linux (untested)
-- Python 3
-- `codesign` (macOS only — ships with macOS)
+- **Node.js (LTS) on PATH** — all platforms; scanning and patching run through one Node tool
+- `codesign` on macOS (ships with Xcode Command Line Tools)
+- Claude Code installed as a native binary, and write permission to it
 
-**Windows 10/11:**
-- arm64 (tested) or x64 (expected to work)
-- PowerShell 5.1+
-- Node.js (LTS) on PATH — required for the bundled binary scanner
-
-**Both:**
-- Claude Code installed as native binary
-- Write permission to the Claude binary
+Platforms: macOS arm64 (tested) / x86_64 (expected), Windows 11 arm64 (tested) / 10-11 x64 (expected), Linux (untested).
 
 ## Usage
 
@@ -61,36 +53,38 @@ Inside a Claude Code session:
 
 ### Model-aware auto-compaction
 
-The `auto-compact-by-model` patch targets Claude Code 2.1.208's central compaction resolver. For models whose resolved context ceiling is above 200K, it sets internal windows that normally trigger at approximately:
+The `auto-compact-by-model` patch targets Claude Code’s central compaction resolver (functionally tested on 2.1.208; derivation verified through 2.1.233). For models whose resolved context ceiling is above 200K, it sets internal windows that normally trigger at approximately:
 
 - `claude-*`: **400K actual context tokens**
 - `gpt-*`: **300K actual context tokens**
 
 A numeric `CLAUDE_CODE_AUTO_COMPACT_WINDOW` remains the fallback for other models. Matched extended-context Claude/GPT rules take precedence, so an existing global value can stay configured for standard or unknown model families. `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` may still compact earlier.
 
-The patch always creates `<binary>.bak.<timestamp>`, supports reverse-patch recovery when no matching backup exists, and requires a Claude Code restart because running processes keep the old executable mapped.
+The patch creates a backup plus a revert sidecar, and requires a Claude Code restart because running processes keep the old executable mapped.
 
 ## How It Works
 
-Claude Code is distributed as a bun-compiled binary with embedded JS bundles. Some behaviors are locked behind hard-coded Zod schemas. This is an Agent Skill — Claude reads the patch definitions and executes the procedure interactively with your confirmation at each step. It applies **safe, length-preserving binary patches** with:
+Claude Code is distributed as a bun-compiled binary with embedded JS bundles. Some behaviors are locked behind hard-coded Zod schemas. This is an Agent Skill — Claude reads the patch definitions and runs the procedure with your confirmation before any write. Each apply is a **length-preserving byte swap**:
 
-1. **Fingerprint detection** — locate exact byte patterns
-2. **Context guard** — verify surrounding stable strings (not minified variables)
-3. **State detection** — determine unpatched / patched / abnormal before acting
-4. **Backup** — always saves `<binary>.bak.<timestamp>`
-5. **Length-preserving swap** — no offset shifts or blob corruption
-6. **Re-sign / signature handling** — ad-hoc codesign on macOS; on Windows the Authenticode signature becomes `HashMismatch` (binary still runs)
-7. **Self-verify** — confirm marker count post-patch
+1. **Derive the anchor** — see below
+2. **Context guards** — stable strings before and after must match, and any variable binding the replacement depends on must be proven, not assumed
+3. **State detection** — unpatched / patched / abnormal, before acting
+4. **Backup** — `<binary>.bak.<timestamp>`, plus a `<binary>.rtk-<patch>.json` sidecar recording the original bytes
+5. **Verified write** — each offset is checked against its expected bytes before being overwritten, so a stale offset aborts instead of corrupting the binary
+6. **Signature** — ad-hoc codesign on macOS; on Windows Authenticode becomes `HashMismatch` (binary still runs)
+7. **Self-verify** — re-scan and confirm the marker count
 
-> Note: the bun-compiled binary embeds the JS bundle 1 or 2 times depending on platform/version (macOS ≤ 2.1.132 = 2, macOS ≥ 2.1.133 = 1, Windows = 1). Patch definitions detect the count dynamically rather than asserting a fixed number.
+### Anchors are derived, not hardcoded
+
+The bundler renames minified identifiers every few builds. A hardcoded anchor then matches 0 times — indistinguishable from "the feature was removed" — so routine drift looks like a broken fingerprint. Real examples from `subagent-model`: `.enum([...])` → `xr([...])` → `Mr([...])`, three rewrites in four months.
+
+So each patch derives its anchor at scan time from landmarks that don't move: string literals the product ships (`.describe()` text, `source:"…"` labels) and positional locals the bundler assigns by position rather than name. The patch definitions document the derivation rule instead of the bytes.
+
+This also covers **bundle multiplicity** — the JS bundle is embedded 1 or 2 times depending on platform/version (macOS ≤ 2.1.132 = 2, ≥ 2.1.133 = 1, Windows = 1). Landmarks are counted, never asserted.
 
 ### Windows specifics
 
-`claude.exe` is locked while running, so apply/revert use a **rename-swap** pattern:
-1. Copy → patch a `.patching` sidecar at the known offset
-2. `Rename-Item` the live `claude.exe` to `.replacing.<ts>` (same-volume rename works on a running .exe)
-3. `Move-Item` the patched copy into place
-4. Restart Claude Code to pick up the new binary; clean up `*.replacing.*` after exit
+`claude.exe` is locked while running, so writes go to a copy that then takes the original's path — renaming a running image only updates the directory entry. Restart Claude Code afterwards, and clean up any `*.replacing.*` file once the old process has exited.
 
 ## Safety
 
@@ -102,16 +96,17 @@ Claude Code is distributed as a bun-compiled binary with embedded JS bundles. So
 ## Contributing
 
 1. Copy [`skills/claude-patch/patches/TEMPLATE.md`](skills/claude-patch/patches/TEMPLATE.md)
-2. Fill in all sections (fingerprint, context guard, replacement, detection, script)
+2. Register the derivation in [`patch-bin.js`](skills/claude-patch/patches/patch-bin.js) and document the rule in your `.md`
 3. Test on at least 2 Claude Code versions
 4. Submit a PR
 
 ### Requirements
 
-- Length-preserving replacement (old bytes == new bytes in length)
-- Unique marker string embedded in replacement for state detection
-- Context guard using stable strings (`.describe()` text, not minified variable names)
-- Tested version list
+- Anchor **derived** from a stable landmark — not a pasted byte sequence containing minified names
+- Length-preserving replacement, ideally referencing only positional locals (they survive renames)
+- A guard that *proves* whatever the replacement assumes about the surrounding code
+- Unique, permanently stable marker string for state detection
+- Tested version list, distinguishing functionally tested from structurally verified
 
 ## Platform Support
 
@@ -123,11 +118,10 @@ Claude Code is distributed as a bun-compiled binary with embedded JS bundles. So
 
 ## Recovery
 
-- Backups are saved as `<binary>.bak.<timestamp>` next to the original
-- **macOS / Linux**: `cp <binary>.bak.<timestamp> <binary> && codesign --force --sign - <binary>` (skip `codesign` on Linux)
-- **Windows**: stop Claude Code, then use rename-swap — `Rename-Item claude.exe claude.exe.broken; Move-Item claude.exe.bak.<ts> claude.exe`. The backup retains the original Authenticode signature.
+- Normal route: `/claude-patch revert <patch>`, or `node patch-bin.js revert --patch <patch>`. It prefers the `<binary>.rtk-<patch>.json` sidecar (exact reverse-patch), falls back to a content-validated `<binary>.bak.<timestamp>`, and snapshots `<binary>.preRevert.<ts>` first.
+- **Keep the sidecar.** A patched binary alone cannot reconstruct a drifted minified alias — only its length survives.
+- **Don't restore a backup by size or filename.** On macOS the backup is Apple-signed while the patched binary is ad-hoc signed, so sizes legitimately differ; and Claude Code re-bundles within a dot-version, so same name ≠ same build. Let `revert` validate it by content.
 - Clean up Windows `*.replacing.*` files after Claude Code has exited (they may stay on disk while the old process is still mapped)
-- **If your `.bak` size doesn't match the current binary**, use the patch-specific revert flow rather than copying blindly. Most patches require equal size; macOS patches that replace Anthropic's signature may instead validate the same Claude version plus the patch's unpatched fingerprint before restoring. Otherwise they fall back to an in-place reverse-patch.
 - To reinstall Claude Code: delete the install dir (`~/.local/share/claude/` on Unix, `%USERPROFILE%\.local\bin\claude.exe` on Windows) and re-run the installer
 
 ## License

@@ -7,89 +7,93 @@ One-line description of what this patch does.
 | Field | Value |
 |-------|-------|
 | Author | @github-username |
-| Tested versions | 2.1.X, 2.1.Y |
+| Version | 1.0.0 |
+| Tested versions | 2.1.X (functional); derivation verified on 2.1.Y |
 | Risk level | low / medium / high |
-| Reversible | yes (backup) |
+| Reversible | yes (sidecar reverse-patch, or backup) |
+| Platforms | which are actually tested, and which merely share the code path |
+
+## Usage
+
+```bash
+node patch-bin.js scan   --patch {{NAME}}
+node patch-bin.js apply  --patch {{NAME}}
+node patch-bin.js revert --patch {{NAME}}
+```
 
 ## Motivation
 
-Why is this patch needed? What limitation does it address?
+What limitation does this address, and why can't configuration solve it?
 
-## Fingerprint
+## Fingerprint — derived, never hardcoded
 
-### Anchor pattern (N bytes)
+Do not paste a byte sequence containing minified identifiers as the anchor. The bundler renames them every few builds, and a count of 0 is indistinguishable from "the feature was removed" — so a literal anchor turns routine drift into a false abort. Derive it instead, and register the derivation in `patch-bin.js`.
+
+**Landmark** — a string the product ships (a `.describe()` text, an error message, a `source:"…"` label). Explain why it cannot move without the feature itself changing.
 
 ```
-<exact byte sequence to search for in binary>
+<landmark>
 ```
 
-- Expected count: **N**
-- Length: **N bytes**
+**Derivation:**
 
-### Context guard
+| Step | Rule |
+|---|---|
+| 1 | Find every landmark occurrence — the count **is** the bundle multiplicity, never assert a number |
+| 2 | **anchor** = bytes from … to … |
+| 3 | any expressions the replacement needs, and where they are read from |
+| 4 | post-guard: what must appear after the anchor |
+| 5 | pre-guard: what must appear before it, and which regex validates the shape |
 
-**Before** (must appear within 100 bytes preceding anchor):
-```
-<surrounding text before the anchor>
-```
+State what each guard proves. If the replacement depends on a variable binding (e.g. a positional local), the guard must **check** that binding rather than assume it — that check is what makes the patch safe on an untested version.
 
-**After** (must immediately follow anchor):
-```
-<surrounding text after the anchor>
-```
+Record what the derivation yields per version, so drift is visible at a glance:
 
-### Stability notes
-
-Why is this fingerprint stable across versions? What could break it?
+| Version | anchor (derived) | notes |
+|---|---|---|
+| 2.1.X | `…` | |
 
 ## Replacement
 
-| Old (N bytes) | New (N bytes) |
-|---|---|
-| `<old>` | `<new>` |
-
-Must be **length-preserving**. Explain padding if needed.
-
-### Patch marker
-
 ```
-<UNIQUE_MARKER_STRING>
+replacement = <expression> right-padded with spaces to len(anchor)
 ```
+
+Must be **length-preserving**; state the byte budget and why it fits in the worst case. Prefer referencing only positional locals — they survive renames.
+
+Marker: `<UNIQUE_MARKER_STRING>` (must be unique in the binary and stable forever, since it identifies binaries patched by older versions of this definition).
 
 ## State detection
 
 | Anchor count | Marker count | State | Action |
 |---|---|---|---|
-| N | 0 | Unpatched | OK to patch |
-| 0 | N | Patched | Skip |
-| other | other | Abnormal | Abort |
+| ≥ 1 | 0 | Unpatched | Patch all sites |
+| 0 | ≥ 1 | Patched | Skip |
+| ≥ 1 | ≥ 1 | Abnormal | Abort — partial/concurrent patch |
+| 0 | 0 | Abnormal | Abort — landmark gone, re-derive |
 
-## Patch script
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-# Full patch script here
-# Must: detect → guard → backup → patch → re-sign → verify
-```
+Note whether a patched binary still contains the landmark. If the replacement rewrites it, `landmarkCount: 0` is expected after patching and marker count is the only signal.
 
 ## Verification
 
 ```bash
-# Commands to confirm patch works correctly
+node patch-bin.js scan --patch {{NAME}}
 ```
+
+Plus a functional test: what should now work that did not before?
 
 ## Post-patch behavior
 
-Describe what changes functionally after the patch is applied.
+What changes at runtime. Does it need a restart? Do wrong inputs fail loudly or silently?
 
 ## Caveats
 
-- Known risks or edge cases
-- Interactions with other features
+- What is tested functionally versus only structurally
+- Interactions with other patches
+- Signing consequences per platform
 
 ## Changelog
 
 | Date | Version | Note |
 |------|---------|------|
-| YYYY-MM-DD | 1.0 | Initial |
+| YYYY-MM-DD | 1.0.0 | Initial |

@@ -5,148 +5,76 @@ disable-model-invocation: true
 argument-hint: "apply|revert|status|list [patch-name]"
 metadata:
   author: huybuidac
-  version: "1.6.0"
-  compatibility: "macOS/Linux (arm64/x86_64) with codesign (macOS) + python3, OR Windows 10/11 (arm64/x64) with PowerShell 5.1+ and Node.js (required for binary scanner)."
+  version: "1.7.0"
+  compatibility: "macOS, Linux, and Windows 10/11 (arm64/x86_64). Requires Node.js on PATH; macOS additionally needs codesign (ships with Xcode CLT)."
 ---
 
 # claude-patch
 
 Binary patches for Claude Code CLI — unlock hard-coded limitations without waiting for upstream changes.
 
+All scanning and patching runs through one cross-platform tool, [patches/patch-bin.js](patches/patch-bin.js). It handles ad-hoc re-signing on macOS and the rename-swap a locked `claude.exe` needs on Windows, so there are no per-platform scripts to choose between.
+
+```bash
+node patches/patch-bin.js scan   --patch <name> [--bin <path>]   # state + derived anchor + guards
+node patches/patch-bin.js apply  --patch <name> [--bin <path>]
+node patches/patch-bin.js revert --patch <name> [--bin <path>]
+```
+
+`--bin` defaults to the resolved `claude` on PATH. `scan` exits 1 when the state is abnormal.
+
 ## Workflow
 
-1. Detect platform (macOS/Linux vs Windows) and Claude Code binary
-2. Ask user which patch to apply (or accept from argument)
-3. Load patch definition from `patches/` directory
-4. Detect state (unpatched / patched / abnormal)
-5. Confirm with user before any modification
-6. Backup → Patch → Re-sign (macOS) / strip-or-skip-sig (Windows) → Verify
+1. **Identify the binary** — run `scan`; it prints the resolved path, size, and state. Show the user the path and `claude --version` before proposing any write.
+2. **Select the patch** — from the user's argument, or ask. Read `patches/<name>.md` for what it does and what it is tested on.
+3. **Confirm** — never write without explicit user confirmation for this specific binary.
+4. **Apply or revert** — `apply` handles guard checks, backup, the write, the sidecar, re-signing, and self-verification in one step, and refuses rather than guessing if anything is off.
+5. **Report** — state the resulting marker count and whether a restart is needed (patch-dependent; `subagent-model` needs none, `auto-compact-by-model` does).
 
-## Step 0: Detect platform (do this FIRST, exactly once)
-
-Set `$PLATFORM` to either `unix` or `windows`. **For every subsequent step in this skill, execute ONLY the block matching `$PLATFORM` — do not run both Unix and Windows blocks for the same step.**
-
-Pick the snippet matching the shell you have:
-
-- **Bash available** (macOS/Linux):
-  ```bash
-  case "$(uname -s 2>/dev/null)" in Darwin|Linux) PLATFORM=unix ;; *) PLATFORM=windows ;; esac
-  ```
-- **PowerShell available** (Windows):
-  ```powershell
-  $Platform = if ($IsWindows -or $env:OS -eq 'Windows_NT') { 'windows' } else { 'unix' }
-  ```
-
-If you have access to both, prefer the one matching the OS (bash on Unix, PowerShell on Windows). Don't try both — pick one.
-
-## Step 1: Detect binary
-
-**Unix (bash):**
-```bash
-CLAUDE_BIN=$(python3 -c "import os,shutil; p=shutil.which('claude'); print(os.path.realpath(p) if p else '')" 2>/dev/null)
-[ -z "$CLAUDE_BIN" ] && CLAUDE_BIN="$HOME/.local/share/claude/current"
-```
-
-**Windows (PowerShell):**
-```powershell
-$CLAUDE_BIN = (Get-Command claude -ErrorAction SilentlyContinue).Source
-if (-not $CLAUDE_BIN) { $CLAUDE_BIN = "$env:USERPROFILE\.local\bin\claude.exe" }
-```
-
-Show path and version for user confirmation before proceeding.
-
-## Step 2: Select patch
-
-If user specified a patch name → use it directly.
-Otherwise → list available patches and ask user to choose.
-
-Available patches — read each `.md` file in [patches/](patches/) directory:
+## Available patches
 
 | Patch | Description |
 |-------|-------------|
 | [subagent-model](patches/subagent-model.md) | Unlock `model` param on Agent tool — use any model id per-call |
-| [auto-compact-by-model](patches/auto-compact-by-model.md) | Use model-aware extended-context compact targets (Claude ≈400K, GPT ≈300K) |
+| [auto-compact-by-model](patches/auto-compact-by-model.md) | Model-aware extended-context compact targets (Claude ≈400K, GPT ≈300K) |
 
-Commands:
-- `apply <patch-name>` — apply a patch
-- `revert <patch-name>` — revert (restore from backup)
-- `status` — show state of all patches on current binary
-- `list` — list available patches
-
-## Step 3: Load and execute patch
-
-Read the patch definition file at `${CLAUDE_SKILL_DIR}/patches/<name>.md`. Each file contains:
-- Fingerprint (anchor pattern + expected count)
-- Context guard (surrounding bytes to verify correct location)
-- Replacement (length-preserving byte swap)
-- State detection logic
-- Verification steps
-
-When a patch uses the shared Node scanner, select it explicitly with `scan-bin.js <binary> --patch <name> --json`. Omitting `--patch` remains backward-compatible and selects `subagent-model`.
+Commands: `apply <patch>`, `revert <patch>`, `status` (scan every patch), `list`.
 
 ## Safety rules
 
-- **NEVER** patch without explicit user confirmation
-- **NEVER** patch if fingerprint or context guard doesn't match
-- **ALWAYS** backup before patching (`<binary>.bak.<timestamp>`)
-- **macOS**: re-sign after patching (Gatekeeper requires valid signature)
-- **Windows**: don't re-sign — Authenticode signature becomes invalid (`HashMismatch`) but binary still runs; document the change to the user
-- **ALWAYS** self-verify marker count after patching
-- If state is abnormal → abort and report, never patch blind
+- **NEVER** patch without explicit user confirmation.
+- **NEVER** patch if a context guard fails — `apply` enforces this, so do not work around it.
+- If state is `abnormal`, abort and report. Both-zero (no anchor, no marker) means the fingerprint changed: re-derive it before doing anything else, never patch blind.
+- Every write is length-preserving and verified against the expected bytes at that offset first, so a stale offset aborts instead of corrupting the binary.
+- Backups (`<binary>.bak.<ts>`) are ~290 MB each. Mention rotation after a version is confirmed working.
+
+## Why anchors are derived, not hardcoded
+
+Every literal anchor in this skill's history eventually matched 0 times, because the bundler renames minified identifiers every few builds. A count of 0 is indistinguishable from "the feature was removed", so a hardcoded anchor turns routine drift into a false abort.
+
+Each patch therefore derives its anchor at scan time from landmarks that do not move — string literals the product ships (`.describe()` text, `source:"…"` labels) and positional locals the bundler assigns by position. Patch definitions document the derivation rule rather than the bytes. When adding a patch, find a landmark first; if the only stable thing you can find is a minified name, expect it to rot.
 
 ## Bundle multiplicity
 
-The bun-compiled binary may embed the JS bundle one or more times depending on platform/version:
+The bun-compiled binary may embed the JS bundle more than once:
 
-- macOS ≤ 2.1.132: **2 instances**
-- macOS ≥ 2.1.133: **1 instance** (Anthropic switched packaging)
-- Windows: **1 instance** (all observed versions)
+- macOS ≤ 2.1.132: **2 instances**; macOS ≥ 2.1.133: **1**
+- Windows: **1** (all observed versions)
 
-Patch definitions detect the count dynamically — never hard-assert a specific number. State detection rule: any positive anchor count = unpatched; any positive marker count = patched; mixed = abnormal.
+Never hard-assert a count — derivation counts landmarks and patches all of them.
 
-## Windows-specific notes
+## Revert
 
-- **File-lock**: `claude.exe` cannot be modified in-place while the process is running. Use the rename-swap pattern:
-  1. Copy `claude.exe` → `claude.exe.patching`
-  2. Patch the copy at the known offset
-  3. `Rename-Item claude.exe → claude.exe.bak.<ts>` (works on running .exe — same volume rename only updates directory entry)
-  4. `Move-Item claude.exe.patching → claude.exe`
-- **Backups stay around** — running process keeps the `.bak` file open until exit. Cleanup of old backups should happen after Claude Code is restarted.
-- **Signature**: Authenticode by Anthropic, PBC. After patching, `Get-AuthenticodeSignature` reports `HashMismatch`. Windows still executes the binary; SmartScreen/AppLocker may flag it depending on policy.
+`revert` prefers the **sidecar** `<binary>.rtk-<patch>.json` that `apply` writes: it records the original bytes for each offset, so the reverse-patch is exact and immune to build mismatch. This matters because a patched binary alone cannot reconstruct a drifted alias — only its length survives.
 
-## Step 4: Verification
+Without a sidecar (patched before they existed) it falls back to a **content-validated backup**: the candidate must itself scan as unpatched with matching landmarks and guards. Do **not** gate on file size — on macOS the backup is Apple-signed while the patched binary is ad-hoc signed, so their sizes legitimately differ. A `<binary>.preRevert.<ts>` snapshot is taken before any write, so the revert itself is undoable.
 
-After patching, run the verification block in the patch definition that matches your `$PLATFORM`. Each patch file provides parallel Unix and Windows verification — run only the one for your platform.
+## Platform notes
 
-## Revert workflow
-
-When reverting a patch:
-
-1. **Find backups**:
-   ```bash
-   # Unix
-   ls -t "$CLAUDE_BIN".bak.* | head -5
-   ```
-   ```powershell
-   # Windows
-   Get-ChildItem "$CLAUDE_BIN.bak.*" | Sort-Object LastWriteTime -Descending | Select-Object -First 5
-   ```
-2. **Show timestamps and sizes** and let user pick which backup to restore.
-3. **Confirm current binary is patched** before reverting — check marker count > 0.
-4. **Choose revert mode**:
-   - **Backup restore (preferred)** — normally only if backup file size matches current binary size (same sub-build). A patch definition may explicitly allow a macOS signature-size mismatch when it additionally verifies the same Claude version and the patch's unpatched fingerprint. Claude Code occasionally re-bundles within the same dot-version, so never restore by filename alone.
-     - Unix: `cp "$BACKUP" "$CLAUDE_BIN"`
-     - Windows: same rename-swap pattern as for apply (running `claude.exe` is locked)
-   - **In-place reverse-patch (fallback)** — when no validated backup exists. Write the patch's original bytes back over its exact marker-bearing replacement. Length-preserving and independent of backup integrity; see each patch definition for the exact reverse procedure.
-5. **Always make a safety snapshot** (`<binary>.preRevert.<ts>`) of the current patched binary before any write, so the revert itself is undoable.
-6. **Re-sign (macOS only)**:
-   ```bash
-   codesign --remove-signature "$CLAUDE_BIN" 2>/dev/null || true
-   codesign --force --sign - "$CLAUDE_BIN"
-   ```
-   Windows: skip — backup retains the original Authenticode signature unchanged.
-7. **Verify** marker count is 0 and anchor count is positive (any value, depending on bundle multiplicity).
+- **macOS** — patching invalidates Anthropic's signature; `apply`/`revert` re-sign ad-hoc and verify. Gatekeeper may prompt on first launch.
+- **Windows** — a running `claude.exe` is locked, so writes go to a copy that then takes the original's path (renaming a running image only updates the directory entry). Authenticode becomes `HashMismatch`; the binary still runs, though SmartScreen/AppLocker policy may object. A displaced `*.replacing.*` file may linger until the old process exits.
+- **Auto-update** — each new Claude Code version ships a fresh, unpatched binary. Re-apply per version.
 
 ## Contributing
 
-To add a new patch, create `${CLAUDE_SKILL_DIR}/patches/<name>.md` following the structure in [patches/TEMPLATE.md](patches/TEMPLATE.md).
+To add a new patch, create `${CLAUDE_SKILL_DIR}/patches/<name>.md` following [patches/TEMPLATE.md](patches/TEMPLATE.md), and register its derivation in `patch-bin.js`.
