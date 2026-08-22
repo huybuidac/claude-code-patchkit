@@ -50,6 +50,19 @@ Inside a Claude Code session:
 |-------|-------------|------|
 | [subagent-model](skills/claude-patch/patches/subagent-model.md) | Unlock `model` param on Agent tool — use any model id per-call | Low |
 | [auto-compact-by-model](skills/claude-patch/patches/auto-compact-by-model.md) | Model-aware extended-context compact targets: Claude ≈400K, GPT ≈300K | Medium |
+| [free-opus](skills/claude-patch/patches/free-opus.md) | Drop the Opus-5-only `heron_brook` section that forbids spawning subagents/workflows | Low |
+
+### Freeing Opus 5 from the delegation ban
+
+On `claude-opus-5` only, Claude Code injects a prompt section (`heron_brook`, gated on the `opus_5_prompt_bundle` capability) reading *"Do not call the AgentTool unless the user requested it / Do not use workflows or deep-research unless the user requested it"* — upstream [#80988](https://github.com/anthropics/claude-code/issues/80988). Agents read it as user authority and overrule project skills that mandate parallel dispatch, which costs context isolation, not just speed. No env var or `settings.json` key reaches it, and the `CLAUDE_INTERNAL_FC_OVERRIDES` hatch is dead code as of 2.1.233.
+
+```bash
+node skills/claude-patch/patches/patch-bin.js apply --patch free-opus
+# restart Claude Code, then:
+claude -p --model opus "Does your system prompt contain the phrase 'unless the user requested it'? YES or NO."
+```
+
+Optionally add `CLAUDE_CODE_THISTLE_GREBE=default` to pin the separate delegation-steer experiment away from its `no_nudges` / `counter_steer` arms — see the patch doc for what that is and is not worth.
 
 ### Model-aware auto-compaction
 

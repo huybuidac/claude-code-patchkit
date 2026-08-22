@@ -5,7 +5,7 @@ disable-model-invocation: true
 argument-hint: "apply|revert|status|list [patch-name]"
 metadata:
   author: huybuidac
-  version: "1.7.0"
+  version: "1.8.0"
   compatibility: "macOS, Linux, and Windows 10/11 (arm64/x86_64). Requires Node.js on PATH; macOS additionally needs codesign (ships with Xcode CLT)."
 ---
 
@@ -29,7 +29,7 @@ node patches/patch-bin.js revert --patch <name> [--bin <path>]
 2. **Select the patch** — from the user's argument, or ask. Read `patches/<name>.md` for what it does and what it is tested on.
 3. **Confirm** — never write without explicit user confirmation for this specific binary.
 4. **Apply or revert** — `apply` handles guard checks, backup, the write, the sidecar, re-signing, and self-verification in one step, and refuses rather than guessing if anything is off.
-5. **Report** — state the resulting marker count and whether a restart is needed (patch-dependent; `subagent-model` needs none, `auto-compact-by-model` does).
+5. **Report** — state the resulting marker count and whether a restart is needed (patch-dependent; `subagent-model` needs none, `auto-compact-by-model` and `free-opus` do).
 
 ## Available patches
 
@@ -37,6 +37,7 @@ node patches/patch-bin.js revert --patch <name> [--bin <path>]
 |-------|-------------|
 | [subagent-model](patches/subagent-model.md) | Unlock `model` param on Agent tool — use any model id per-call |
 | [auto-compact-by-model](patches/auto-compact-by-model.md) | Model-aware extended-context compact targets (Claude ≈400K, GPT ≈300K) |
+| [free-opus](patches/free-opus.md) | Drop the Opus-5-only `heron_brook` section that forbids spawning subagents/workflows |
 
 Commands: `apply <patch>`, `revert <patch>`, `status` (scan every patch), `list`.
 

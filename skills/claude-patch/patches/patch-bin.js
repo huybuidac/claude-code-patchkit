@@ -49,9 +49,28 @@ const AUTOCOMPACT = {
   ],
 };
 
+const FREEOPUS = {
+  marker: '0&&$FO',
+  markExpr: 'if(0&&$FO)',
+  // Telemetry event name — emitted by every tier of the heron_brook resolver, so it
+  // cannot be dropped while the section still ships.
+  landmark: 'tengu_heron_brook_applied',
+  // Tier 3 only: `",{len:<C>.length,fromClientData:!1}),<C>;return null}`. Tiers 1-2
+  // read a local and close with `}`; the `;return null` tail is the branch being cut,
+  // and the backreference proves the logged constant is the value being returned.
+  tailRe: /^",\{len:([\w$]{1,16})\.length,fromClientData:!1\}\),\1;return null\}/,
+  // `if(<gate>(e))return <log>(` — the model-capability gate whose call is falsified.
+  // The logger alias is captured, not assumed: it was `H` on 2.1.233 and `L` on 2.1.226.
+  headRe: /if\(([\w$.]{1,16})\(e\)\)(return [\w$.]{1,16}\()$/,
+  // Proves <C> holds the anti-delegation payload rather than some other constant.
+  payloadInit: '=["Do not call the AgentTool unless the user requested it",'
+    + '"Do not use workflows or deep-research unless the user requested it"]',
+};
+
 const PATCHES = {
   'subagent-model': { marker: SUBAGENT.marker, derive: deriveSubagentSites },
   'auto-compact-by-model': { marker: AUTOCOMPACT.marker, derive: deriveAutocompactSites },
+  'free-opus': { marker: FREEOPUS.marker, derive: deriveFreeOpusSites },
 };
 
 // --- io helpers ------------------------------------------------------------
@@ -144,6 +163,31 @@ function deriveAutocompactSites(file) {
     const replacement = isAnchor && preMatch && postMatch ? padTo(c.base, anchor.length) : null;
 
     return { offset, anchor, replacement, preMatch, postMatch, isAnchor };
+  });
+}
+
+function deriveFreeOpusSites(file) {
+  const c = FREEOPUS;
+  return findAll(file, c.landmark).map(lm => {
+    // back covers [lm-64, lm-1]; the byte at lm-1 is the event name's opening quote.
+    const backLen = Math.min(64, lm);
+    const back = readAt(file, lm - backLen, backLen);
+    const fwd = readAt(file, lm + c.landmark.length, 96);
+
+    const tail = c.tailRe.exec(fwd);
+    const constName = tail ? tail[1] : null;
+    const head = c.headRe.exec(back.slice(0, -1));
+    const anchor = head ? `if(${head[1]}(e))` : null;
+    const offset = anchor === null ? lm : lm - 1 - head[2].length - anchor.length;
+
+    const preMatch = anchor !== null;
+    // Cross-file check, not an assumption: the constant this branch returns must be
+    // the two-line payload. A renamed gate is fine; a repurposed constant is not.
+    const postMatch = constName !== null && findAll(file, constName + c.payloadInit).length > 0;
+    const isAnchor = preMatch && tail !== null;
+    const replacement = isAnchor && postMatch ? padTo(c.markExpr, anchor.length) : null;
+
+    return { offset, anchor, constName, replacement, preMatch, postMatch, isAnchor };
   });
 }
 
