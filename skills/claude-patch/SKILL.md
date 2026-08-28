@@ -5,7 +5,7 @@ disable-model-invocation: true
 argument-hint: "apply|revert|status|list [patch-name]"
 metadata:
   author: huybuidac
-  version: "1.8.0"
+  version: "1.9.0"
   compatibility: "macOS, Linux, and Windows 10/11 (arm64/x86_64). Requires Node.js on PATH; macOS additionally needs codesign (ships with Xcode CLT)."
 ---
 
@@ -19,9 +19,11 @@ All scanning and patching runs through one cross-platform tool, [patches/patch-b
 node patches/patch-bin.js scan   --patch <name> [--bin <path>]   # state + derived anchor + guards
 node patches/patch-bin.js apply  --patch <name> [--bin <path>]
 node patches/patch-bin.js revert --patch <name> [--bin <path>]
+node patches/patch-bin.js status [--bin <path>]                  # scan every patch
+node patches/patch-bin.js list                                   # registered patch ids
 ```
 
-`--bin` defaults to the resolved `claude` on PATH. `scan` exits 1 when the state is abnormal.
+`--bin` defaults to the resolved `claude` on PATH. `scan` exits 1 when the state is abnormal, `status` when any patch is.
 
 ## Workflow
 

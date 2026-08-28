@@ -7,8 +7,8 @@ Unlock the `model` parameter on the Agent/Task tool from a fixed model-alias enu
 | Field | Value |
 |-------|-------|
 | Author | @huybuidac |
-| Version | 1.7.0 |
-| Tested versions | 2.1.116 → 2.1.233 macOS arm64; 2.1.x Windows arm64 (see [Changelog](#changelog)) |
+| Version | 1.7.1 |
+| Tested versions | 2.1.116 → 2.1.250 macOS arm64; 2.1.x Windows arm64 (see [Changelog](#changelog)) |
 | Risk level | low |
 | Reversible | yes (sidecar reverse-patch, or backup) |
 | Platforms | macOS (arm64/x86_64), Linux, Windows (arm64/x64) |
@@ -128,6 +128,7 @@ Functional test — in a fresh session, spawn an Agent with a full model ID (`mo
 
 | Date | Version | Note |
 |------|---------|------|
+| 2026-08-28 | 1.7.1 | Applied to 2.1.239 and 2.1.250 macOS arm64, no derivation change needed. Aliases drifted twice (`Lr`/`H` on 2.1.239 → `le`/`i` on 2.1.250) and 2.1.250 shrank the binary from 310 MB to 197 MB, but the landmark and 40-byte 4-enum are unchanged and the derived anchor matched first try on both. |
 | 2026-05-06 | 1.0 | Initial — 2.1.116/119/121, 32-byte 3-alias enum, macOS 2-instance bundle. |
 | 2026-05-08 | 1.1 | Windows port — 1-instance bundle, rename-swap for the file lock, Node scanner, signature left invalid. |
 | 2026-05-09 | 1.2.0 | Bundle count made dynamic (2.1.133 switched macOS 2 → 1 instance, which the old `hits == 2` assertion called abnormal). Corrected post-patch behavior: no restart needed; unknown IDs silently inherit. |

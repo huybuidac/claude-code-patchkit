@@ -4,6 +4,8 @@
 //   node patch-bin.js scan   [--patch <id>] [--bin <path>] [--json]
 //   node patch-bin.js apply  [--patch <id>] [--bin <path>]
 //   node patch-bin.js revert [--patch <id>] [--bin <path>]
+//   node patch-bin.js status [--bin <path>] [--json]   # scan every registered patch
+//   node patch-bin.js list                             # registered patch ids
 //
 // Nothing here hardcodes a minified identifier. Every few builds the bundler renames
 // them, and a literal anchor then matches 0 times — which state detection cannot tell
@@ -35,11 +37,19 @@ const AUTOCOMPACT = {
   marker: 'RTK-AUTOCOMPACT-PATCH',
   landmark: 'if(process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW){let ',
   tail: 'source:"env"}}}',
-  base: '{let E=process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW,T=o>2e5?r.startsWith("gpt-")?333000:r.startsWith("claude-")?433000:+E:+E;if(T>0){T=Math.max(1e5,T);return{window:Math.min(o,T),configured:T,source:"env"/*RTK-AUTOCOMPACT-PATCH*/}}}',
-  // The replacement reads only positional locals, so it survives renames — but it is
-  // valid ONLY while the resolver still binds `o` to the ceiling and `r` to the model.
-  // This regex is what proves that, which is why preMatch is a hard gate here.
-  prologueRe: /function [\w$]{1,8}\(e,t,r=[\w$]{1,8}\(\)\)\{let n=[\w$]{1,8}\(e\),o=[\w$]{1,8}\(e,r\);$/,
+  // Resolver prologue: `function <F>(e,t,r=<G>()){let <model>=<H>(e),<ceil>=<I>(e,r);`
+  // Both locals are CAPTURED, never assumed. They were n/o on 2.1.239 and o/u on
+  // 2.1.250; every letter previously hardcoded here matched 0 times on 2.1.250 and
+  // the scanner reported a false "fingerprint changed".
+  //
+  // `r` is NOT the model. It is the capabilities/betas value also handed to <I>(e,r),
+  // <J>(e,r) and <K>(e,r); the model id is the FIRST local, the one the resolver uses
+  // as a Set/Map key. A replacement calling r.startsWith() throws at runtime.
+  prologueRe: /function [\w$]{1,8}\(e,t,r=[\w$]{1,8}\(\)\)\{let ([\w$]{1,8})=[\w$]{1,8}\(e\),([\w$]{1,8})=[\w$]{1,8}\(e,r\);$/,
+  // The scalar-env branch, every local captured and back-referenced so the shape itself
+  // proves the bindings: <env> parse result, <floor> the 1e5 constant, <res> the
+  // resolved window, <ceil> the context ceiling.
+  envRe: /^([\w$]{1,16})=[\w$.]{1,24}\("CLAUDE_CODE_AUTO_COMPACT_WINDOW",process\.env\.CLAUDE_CODE_AUTO_COMPACT_WINDOW,([\w$]{1,16}),[\w$]{1,16}\);if\(\1\.status!=="invalid"\)\{let ([\w$]{1,16})=Math\.max\(\2,\1\.effective\);return\{window:Math\.min\(([\w$]{1,16}),\3\),configured:\3,source:"env"\}\}\}$/,
   requireAfter: [
     'source:"settings"',
     'source:"clientdata"',
@@ -147,6 +157,16 @@ function deriveSubagentSites(file) {
   });
 }
 
+// Built from the captured locals rather than baked in, so a rename shifts the bytes
+// instead of breaking the patch. Reuses the env branch's own block-scoped names, which
+// are already proven collision-free in that scope.
+function autocompactReplacement(model, ceil, env, res) {
+  return `{let ${env}=process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW,${res}=${ceil}>2e5?`
+    + `${model}.startsWith("gpt-")?333000:${model}.startsWith("claude-")?433000:+${env}:+${env};`
+    + `if(${res}>0){${res}=Math.max(1e5,${res});`
+    + `return{window:Math.min(${ceil},${res}),configured:${res},source:"env"/*RTK-AUTOCOMPACT-PATCH*/}}}`;
+}
+
 function deriveAutocompactSites(file) {
   const c = AUTOCOMPACT;
   return findAll(file, c.landmark).map(offset => {
@@ -157,12 +177,28 @@ function deriveAutocompactSites(file) {
     const anchor = t < 0 ? null : win.slice(0, t + c.tail.length);
     const after = anchor === null ? '' : readAt(file, offset + anchor.length, 700);
 
-    const preMatch = c.prologueRe.test(before);
-    const postMatch = anchor !== null && c.requireAfter.every(s => after.includes(s));
-    const isAnchor = anchor !== null && anchor.includes('Math.min(o,c)');
-    const replacement = isAnchor && preMatch && postMatch ? padTo(c.base, anchor.length) : null;
+    const pro = c.prologueRe.exec(before);
+    const env = anchor === null ? null : c.envRe.exec(anchor.slice(c.landmark.length));
+    const model = pro ? pro[1] : null;
+    const ceil = pro ? pro[2] : null;
 
-    return { offset, anchor, replacement, preMatch, postMatch, isAnchor };
+    // Cross-check, not assumption: the ceiling the env branch narrows must be the local
+    // the prologue bound to <I>(e,r). This is what the old `Math.min(o,c)` literal was
+    // standing in for, minus the dependency on which letters the bundler picked.
+    const preMatch = pro !== null && env !== null && env[4] === ceil;
+    // The model local must still be used as a model key downstream (`<Set>.has(<model>)`,
+    // the set of extended-context model ids). Without this the replacement could call
+    // .startsWith() on a non-string and throw inside the resolver.
+    const postMatch = anchor !== null && model !== null
+      && c.requireAfter.every(s => after.includes(s))
+      && after.includes(`.has(${model})`);
+
+    const isAnchor = anchor !== null && env !== null;
+    const replacement = isAnchor && preMatch && postMatch
+      ? padTo(autocompactReplacement(model, ceil, env[1], env[3]), anchor.length)
+      : null;
+
+    return { offset, anchor, model, ceil, replacement, preMatch, postMatch, isAnchor };
   });
 }
 
@@ -405,7 +441,7 @@ let json = false;
 
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
-  if (a === 'scan' || a === 'apply' || a === 'revert') cmd = a;
+  if (a === 'scan' || a === 'apply' || a === 'revert' || a === 'status' || a === 'list') cmd = a;
   else if (a === '--json') json = true;
   else if (a === '--patch') patchId = argv[++i];
   else if (a.startsWith('--patch=')) patchId = a.slice(8);
@@ -415,11 +451,28 @@ for (let i = 0; i < argv.length; i++) {
   else bin = a; // positional path, for backward compatibility
 }
 
+if (cmd === 'list') {
+  for (const id of Object.keys(PATCHES)) console.log(id);
+  process.exit(0);
+}
+
 if (!PATCHES[patchId]) die(`unknown patch: ${patchId}. Available: ${Object.keys(PATCHES).join(', ')}`);
 bin = bin ? path.resolve(bin) : resolveBin();
 if (!fs.existsSync(bin)) die(`binary not found: ${bin}`);
 
-if (cmd === 'scan') {
+if (cmd === 'status') {
+  // Exit 1 if ANY patch is abnormal — one bad fingerprint is the thing worth noticing.
+  let bad = 0;
+  const all = [];
+  for (const id of Object.keys(PATCHES)) {
+    const r = scan(bin, id);
+    if (r.state === 'abnormal') bad++;
+    if (json) all.push(r);
+    else { printScan(r, false); console.log(); }
+  }
+  if (json) console.log(JSON.stringify(all, null, 2));
+  process.exit(bad ? 1 : 0);
+} else if (cmd === 'scan') {
   const r = scan(bin, patchId);
   printScan(r, json);
   process.exit(r.state === 'abnormal' ? 1 : 0);
