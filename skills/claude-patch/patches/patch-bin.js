@@ -14,6 +14,13 @@
 //
 // One implementation covers macOS, Linux, and Windows: ad-hoc re-signing on darwin,
 // rename-swap on win32 (a running claude.exe is locked and cannot be written in place).
+//
+// Since 2.1.250 the binary also ships a JSC bytecode copy of each module and runs THAT,
+// leaving the embedded JS source as dead weight for stack traces. A source-only patch is
+// then silently inert: the marker is in the file, the behaviour is unchanged. So every
+// apply also zeroes the `bytecode` slice of the module holding the patch site, which makes
+// bun fall back to compiling that module's source — the copy the patch edits. See the
+// bun module-graph section below.
 
 const fs = require('fs');
 const path = require('path');
@@ -77,10 +84,25 @@ const FREEOPUS = {
     + '"Do not use workflows or deep-research unless the user requested it"]',
 };
 
+const RESUMEMODEL = {
+  marker: 'RTK-RESUME-MODEL',
+  markComment: '/*RTK-RESUME-MODEL*/',
+  // The reason tag the resume path returns; the message the user sees is looked up from it.
+  landmark: '?"unknown_family":',
+  // `<c1>?"unknown_family":<c2>?"not_allowed":<retired>?"retired":void 0` — only the retired
+  // call is kept, so a genuinely retired model still declines client-side.
+  shapeRe: /^.+\?"unknown_family":.+\?"not_allowed":([\w$.]{1,16}\([\w$]{1,8}\))\?"retired":void 0$/,
+  // Same statement, so the backreference proves the local we neutralise is the one the
+  // decline branch reads — not some other ternary that happens to sit nearby.
+  declinePrefix: v => `if(${v})return{kind:"declined",model:`,
+  reasonMap: 'unknown_family:"not a model this version of Claude Code recognizes"',
+};
+
 const PATCHES = {
   'subagent-model': { marker: SUBAGENT.marker, derive: deriveSubagentSites },
   'auto-compact-by-model': { marker: AUTOCOMPACT.marker, derive: deriveAutocompactSites },
   'free-opus': { marker: FREEOPUS.marker, derive: deriveFreeOpusSites },
+  'resume-model': { marker: RESUMEMODEL.marker, derive: deriveResumeModelSites },
 };
 
 // --- io helpers ------------------------------------------------------------
@@ -131,6 +153,93 @@ function padTo(body, width) {
 function die(msg) {
   console.error(`ERROR: ${msg}`);
   process.exit(1);
+}
+
+// --- bun standalone module graph -------------------------------------------
+
+// Layout of bun v1.4.x `CompiledModuleGraphFile` (src/standalone_graph/StandaloneModuleGraph.rs):
+// six StringPointer{u32 offset, u32 len} — name, contents, sourcemap, bytecode, module_info,
+// bytecode_origin_path — then encoding/loader/module_format/side as u8. Nothing here is
+// searched for by name; the record is located by asking which module's `contents` range
+// contains the patch site, so a renamed chunk changes nothing.
+const GRAPH = {
+  magic: '\n---- Bun! ----\n',
+  recSize: 52,
+  bytecodeAt: 24, // byte offset of the bytecode StringPointer within a record
+  namePrefix: '/$bunfs/root/',
+  tailScan: 8 * 1024 * 1024,
+};
+
+const u32le = n => Buffer.from(Uint32Array.of(n).buffer).toString('latin1');
+
+// Returns null when the trailer does not decode with the layout above — an older bun, or a
+// newer struct. Callers must treat null as "cannot reason about bytecode here", never as
+// "there is no bytecode".
+function parseGraph(file) {
+  try {
+    const size = fs.statSync(file).size;
+    const from = Math.max(0, size - GRAPH.tailScan);
+    const tail = readAt(file, from, size - from);
+    const rel = tail.lastIndexOf(GRAPH.magic);
+    if (rel < 0) return null;
+    const magic = from + rel;
+
+    const head = Buffer.from(readAt(file, magic - 32, 32), 'latin1');
+    const byteCount = Number(head.readBigUInt64LE(0));
+    const modOff = head.readUInt32LE(8);
+    const modLen = head.readUInt32LE(12);
+    const base = magic - 32 - byteCount;
+    if (base < 0 || modLen === 0 || modLen % GRAPH.recSize !== 0) return null;
+    if (modOff + modLen > byteCount) return null;
+
+    const table = Buffer.from(readAt(file, base + modOff, modLen), 'latin1');
+    const graph = { base, tableOffset: base + modOff, count: modLen / GRAPH.recSize, table, file };
+    const first = moduleName(graph, 0);
+    if (!first.startsWith(GRAPH.namePrefix)) return null;
+    return graph;
+  } catch {
+    return null;
+  }
+}
+
+const field = (g, rec, at) => ({
+  offset: g.table.readUInt32LE(rec * GRAPH.recSize + at),
+  len: g.table.readUInt32LE(rec * GRAPH.recSize + at + 4),
+});
+
+function moduleName(g, rec) {
+  const p = field(g, rec, 0);
+  return readAt(g.file, g.base + p.offset, Math.min(p.len, 256));
+}
+
+// The module whose `contents` slice contains `offset`, i.e. the one whose source carries
+// the patch. Bytecode for that module shadows the source we just edited.
+function moduleFor(g, offset) {
+  const want = offset - g.base;
+  for (let rec = 0; rec < g.count; rec++) {
+    const c = field(g, rec, 8);
+    if (want >= c.offset && want < c.offset + c.len) {
+      const bc = field(g, rec, GRAPH.bytecodeAt);
+      return {
+        record: rec,
+        module: moduleName(g, rec),
+        len: bc.len,
+        lenOffset: g.tableOffset + rec * GRAPH.recSize + GRAPH.bytecodeAt + 4,
+      };
+    }
+  }
+  return null;
+}
+
+function bytecodeSites(file, offsets) {
+  const g = parseGraph(file);
+  if (!g) return { supported: false, mods: [] };
+  const seen = new Map();
+  for (const o of offsets) {
+    const m = moduleFor(g, o);
+    if (m && !seen.has(m.record)) seen.set(m.record, m);
+  }
+  return { supported: true, mods: [...seen.values()] };
 }
 
 // --- derivations -----------------------------------------------------------
@@ -227,6 +336,38 @@ function deriveFreeOpusSites(file) {
   });
 }
 
+function deriveResumeModelSites(file) {
+  const c = RESUMEMODEL;
+  const mapOk = findAll(file, c.reasonMap).length > 0;
+  return findAll(file, c.landmark).map(lm => {
+    const backLen = Math.min(200, lm);
+    const back = readAt(file, lm - backLen, backLen);
+    const fwd = readAt(file, lm, 400);
+
+    const decl = back.lastIndexOf('let ');
+    const eq = decl < 0 ? -1 : back.indexOf('=', decl);
+    const varName = eq < 0 ? null : back.slice(decl + 4, eq);
+    const semi = fwd.indexOf(';');
+
+    const offset = eq < 0 ? lm : lm - backLen + eq + 1;
+    const anchor = eq < 0 || semi < 0 ? null : back.slice(eq + 1) + fwd.slice(0, semi);
+    const after = semi < 0 ? '' : fwd.slice(semi + 1);
+
+    const shape = anchor === null ? null : c.shapeRe.exec(anchor);
+    const preMatch = varName !== null && /^[\w$]{1,8}$/.test(varName) && shape !== null;
+    const postMatch = preMatch && mapOk && after.startsWith(c.declinePrefix(varName));
+
+    // The replacement keeps the landmark, so a patched site still derives an anchor and
+    // would read as `abnormal` (anchor + marker) the moment padding stops hiding it.
+    const isAnchor = preMatch && !anchor.includes(c.marker);
+    const replacement = isAnchor && postMatch
+      ? padTo(`0${c.markComment}?"unknown_family":0?"not_allowed":${shape[1]}?"retired":void 0`, anchor.length)
+      : null;
+
+    return { offset, anchor, varName, retiredCall: shape ? shape[1] : null, replacement, preMatch, postMatch, isAnchor };
+  });
+}
+
 // --- scan ------------------------------------------------------------------
 
 function scan(file, patchId) {
@@ -249,6 +390,17 @@ function scan(file, patchId) {
 
   const a = anchors.length;
   const m = markerOffsets.length;
+
+  // Which module carries the patch: its anchors while unpatched, its markers once patched.
+  const bc = bytecodeSites(file, a ? anchors.map(s => s.offset) : markerOffsets);
+  const live = bc.mods.filter(x => x.len > 0);
+  if (!bc.supported && (a || m)) {
+    notes.push('bun module graph did not decode — cannot tell whether bytecode shadows the source patch');
+  }
+  if (m >= 1 && a === 0 && live.length) {
+    notes.push(`marker present but ${live.length} module(s) still run from bytecode — the patch is inert; re-run apply to repair`);
+  }
+
   return {
     file,
     size: fs.statSync(file).size,
@@ -264,7 +416,11 @@ function scan(file, patchId) {
     markerOffsets,
     contextGuards: anchors.map(s => ({ offset: s.offset, preMatch: s.preMatch, postMatch: s.postMatch })),
     sites,
-    state: a >= 1 && m === 0 ? 'unpatched' : a === 0 && m >= 1 ? 'patched' : 'abnormal',
+    bytecodeSupported: bc.supported,
+    bytecode: bc.mods,
+    state: a >= 1 && m === 0 ? 'unpatched'
+      : a === 0 && m >= 1 ? (live.length ? 'patched-inert' : 'patched')
+      : 'abnormal',
     notes,
   };
 }
@@ -279,6 +435,10 @@ function printScan(r, json) {
   if (r.anchor) console.log(`  anchor: ${r.anchor}`);
   if (r.replacement) console.log(`  replacement: ${JSON.stringify(r.replacement)}`);
   console.log(`Marker count: ${r.markerCount}`);
+  if (!r.bytecodeSupported) console.log('Bytecode: module graph not decodable');
+  else r.bytecode.forEach(b => {
+    console.log(`Bytecode: ${b.module} rec#${b.record} len=${b.len}${b.len ? ' (SHADOWS the source patch)' : ' (disabled)'}`);
+  });
   r.contextGuards.forEach(g => {
     console.log(`  @ 0x${g.offset.toString(16)} (${g.offset})  preGuard=${g.preMatch} postGuard=${g.postMatch}`);
   });
@@ -336,44 +496,79 @@ const sidecarPath = (bin, patchId) => `${bin}.rtk-${patchId}.json`;
 
 // --- commands --------------------------------------------------------------
 
+// Zeroing the length alone is enough: bun treats an empty bytecode slice as "not cached"
+// and compiles the module's source. The blob itself is left in place so the edit stays
+// length-preserving and exactly reversible from the sidecar.
+function graphEdits(scanResult) {
+  return scanResult.bytecode.filter(b => b.len > 0).map(b => ({
+    module: b.module, record: b.record, offset: b.lenOffset, original: b.len,
+  }));
+}
+
+const graphWrites = edits => edits.map(e => ({ offset: e.offset, expect: u32le(e.original), write: u32le(0) }));
+
+function writeSidecar(bin, patchId, sites, gEdits) {
+  fs.writeFileSync(sidecarPath(bin, patchId), JSON.stringify({
+    patch: patchId,
+    sites: sites.map(s => ({ offset: s.offset, anchor: s.anchor, replacement: s.replacement })),
+    graphEdits: gEdits,
+  }, null, 2));
+}
+
 function cmdApply(bin, patchId) {
   const before = scan(bin, patchId);
   if (before.state === 'patched') {
     console.log(`Already patched (${before.markerCount} marker[s]), nothing to do`);
     return;
   }
-  if (before.state !== 'unpatched') die(`state=${before.state} — refusing to patch (${before.notes.join('; ') || 'mixed anchors and markers'})`);
 
-  const sites = before.sites.filter(s => s.isAnchor);
+  // A binary patched before bytecode shipped, or by an older patch-bin: the source edit is
+  // already in place and only the bytecode shadow needs clearing.
+  const repair = before.state === 'patched-inert';
+  if (!repair && before.state !== 'unpatched') {
+    die(`state=${before.state} — refusing to patch (${before.notes.join('; ') || 'mixed anchors and markers'})`);
+  }
+
+  const sites = repair ? [] : before.sites.filter(s => s.isAnchor);
   for (const s of sites) {
     if (!s.preMatch || !s.postMatch) die(`context guard failed at ${s.offset} (pre=${s.preMatch} post=${s.postMatch})`);
     if (!s.replacement) die(`no length-preserving replacement derivable at ${s.offset}`);
     console.log(`  @${s.offset}: ${s.anchor} -> ${JSON.stringify(s.replacement)}`);
+  }
+  const gEdits = graphEdits(before);
+  gEdits.forEach(e => console.log(`  bytecode off: ${e.module} rec#${e.record} len ${e.original} -> 0`));
+  if (repair && !gEdits.length) die('nothing to repair');
+  if (!repair && !before.bytecodeSupported) {
+    console.log('WARNING: module graph not decodable — if this build runs from bytecode the patch will be inert');
   }
 
   const backup = `${bin}.bak.${Math.floor(Date.now() / 1000)}`;
   fs.copyFileSync(bin, backup);
   console.log(`Backup: ${backup}`);
 
-  writeBinary(bin, sites.map(s => ({ offset: s.offset, expect: s.anchor, write: s.replacement })));
+  writeBinary(bin, [
+    ...sites.map(s => ({ offset: s.offset, expect: s.anchor, write: s.replacement })),
+    ...graphWrites(gEdits),
+  ]);
   // The original bytes cannot be recovered from a patched binary once an alias has
   // drifted (only their length survives), so record them for an exact revert.
-  fs.writeFileSync(sidecarPath(bin, patchId), JSON.stringify({
-    patch: patchId,
-    sites: sites.map(s => ({ offset: s.offset, anchor: s.anchor, replacement: s.replacement })),
-  }, null, 2));
+  const prior = repair && fs.existsSync(sidecarPath(bin, patchId))
+    ? JSON.parse(fs.readFileSync(sidecarPath(bin, patchId), 'utf8'))
+    : null;
+  writeSidecar(bin, patchId, prior ? prior.sites : sites, [...(prior?.graphEdits || []), ...gEdits]);
   resign(bin);
 
   const after = scan(bin, patchId);
-  if (after.state !== 'patched' || after.markerCount !== sites.length) {
+  const wantMarkers = repair ? before.markerCount : sites.length;
+  if (after.state !== 'patched' || after.markerCount !== wantMarkers) {
     die(`self-verify failed (state=${after.state} anchor=${after.anchorCount} marker=${after.markerCount})`);
   }
-  console.log(`Verified: patch applied (${after.markerCount} marker[s])`);
+  console.log(`Verified: patch applied and live (${after.markerCount} marker[s])`);
 }
 
 function cmdRevert(bin, patchId) {
   const before = scan(bin, patchId);
-  if (before.state !== 'patched') die(`state=${before.state} — nothing to revert`);
+  if (before.state !== 'patched' && before.state !== 'patched-inert') die(`state=${before.state} — nothing to revert`);
 
   const snapshot = `${bin}.preRevert.${Math.floor(Date.now() / 1000)}`;
   fs.copyFileSync(bin, snapshot);
@@ -382,9 +577,13 @@ function cmdRevert(bin, patchId) {
   const side = sidecarPath(bin, patchId);
   if (fs.existsSync(side)) {
     const rec = JSON.parse(fs.readFileSync(side, 'utf8'));
-    writeBinary(bin, rec.sites.map(s => ({ offset: s.offset, expect: s.replacement, write: s.anchor })));
+    const g = rec.graphEdits || [];
+    writeBinary(bin, [
+      ...rec.sites.map(s => ({ offset: s.offset, expect: s.replacement, write: s.anchor })),
+      ...g.map(e => ({ offset: e.offset, expect: u32le(0), write: u32le(e.original) })),
+    ]);
     fs.rmSync(side, { force: true });
-    console.log(`Reverse-patched ${rec.sites.length} site(s) from sidecar`);
+    console.log(`Reverse-patched ${rec.sites.length} site(s) and restored ${g.length} bytecode slice(s) from sidecar`);
   } else {
     // No sidecar (patched before sidecars existed). Validate candidates by content:
     // on macOS the Apple-signed backup and the ad-hoc-signed binary differ in size,
@@ -466,7 +665,7 @@ if (cmd === 'status') {
   const all = [];
   for (const id of Object.keys(PATCHES)) {
     const r = scan(bin, id);
-    if (r.state === 'abnormal') bad++;
+    if (r.state === 'abnormal' || r.state === 'patched-inert') bad++;
     if (json) all.push(r);
     else { printScan(r, false); console.log(); }
   }
@@ -475,7 +674,7 @@ if (cmd === 'status') {
 } else if (cmd === 'scan') {
   const r = scan(bin, patchId);
   printScan(r, json);
-  process.exit(r.state === 'abnormal' ? 1 : 0);
+  process.exit(r.state === 'abnormal' || r.state === 'patched-inert' ? 1 : 0);
 } else if (cmd === 'apply') {
   cmdApply(bin, patchId);
 } else {

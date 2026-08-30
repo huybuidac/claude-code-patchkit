@@ -7,7 +7,7 @@ Unlock the `model` parameter on the Agent/Task tool from a fixed model-alias enu
 | Field | Value |
 |-------|-------|
 | Author | @huybuidac |
-| Version | 1.7.1 |
+| Version | 1.8.0 |
 | Tested versions | 2.1.116 → 2.1.250 macOS arm64; 2.1.x Windows arm64 (see [Changelog](#changelog)) |
 | Risk level | low |
 | Reversible | yes (sidecar reverse-patch, or backup) |
@@ -91,20 +91,34 @@ Trailing spaces before `.optional()` are legal JS. The marker `RTK-SUBAGENT-PATC
 
 ## State detection
 
-| Anchor count | Marker count | State | Action |
-|---|---|---|---|
-| ≥ 1 | 0 | **Unpatched** | Patch all; expect marker == anchor count |
-| 0 | ≥ 1 | **Patched** | Skip |
-| ≥ 1 | ≥ 1 | **Abnormal** (mixed) | Abort — partial/concurrent patch |
-| 0 | 0 | **Abnormal** | Abort — landmark gone, re-inspect the binary |
+| Anchor count | Marker count | Bytecode slice | State | Action |
+|---|---|---|---|---|
+| ≥ 1 | 0 | any | **Unpatched** | Patch all; expect marker == anchor count |
+| 0 | ≥ 1 | empty | **Patched** | Skip |
+| 0 | ≥ 1 | non-empty | **Patched-inert** | Re-run `apply` — the write landed on code that never runs |
+| ≥ 1 | ≥ 1 | any | **Abnormal** (mixed) | Abort — partial/concurrent patch |
+| 0 | 0 | any | **Abnormal** | Abort — landmark gone, re-inspect the binary |
 
-`scan` exits 1 on `abnormal`. Its `--json` adds `landmarkCount`, `stringExpr`, `replacement`, and per-site `preMatch`/`postMatch` — enough to diagnose a new drift without a hex editor.
+`scan` exits 1 on `abnormal` and `patched-inert`. Its `--json` adds `landmarkCount`, `stringExpr`, `replacement`, per-site `preMatch`/`postMatch`, and `bytecode` (module name, record index, slice length) — enough to diagnose a new drift without a hex editor.
 
 ## Verification
 
 ```bash
 node patch-bin.js scan --patch subagent-model
 # after apply: State: patched   Anchor count: 0   Marker count: N (bundle multiplicity)
+#              Bytecode: /$bunfs/root/chunk-….js rec#N len=0 (disabled)
+```
+
+Marker counts are necessary, not sufficient — see [Bytecode shadowing](../SKILL.md#bytecode-shadowing). The zero-token behavioural check reads the live schema straight out of the binary:
+
+```bash
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}' \
+  '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
+| "$BIN" mcp serve | grep -o '"model":{[^}]*}'
+# patched:   {"description":"Optional model override…","type":"string"}
+# unpatched: …,"enum":["sonnet","opus","haiku","fable"],…
 ```
 
 Functional test — in a fresh session, spawn an Agent with a full model ID (`model: "claude-haiku-4-5-20251001"`). It should be accepted instead of failing schema validation.
@@ -112,22 +126,24 @@ Functional test — in a fresh session, spawn an Agent with a full model ID (`mo
 ## Post-patch behavior
 
 - The `model` field accepts any string at the Task tool input layer.
-- Schema validation reads the disk binary at each Agent spawn, so the patch takes effect on the next subagent — **no restart required**.
+- **Restart the session after applying.** Versions 1.2.0–1.7.1 of this doc claimed no restart was needed, on the strength of one 2.1.133 test; the only time that was re-checked (2.1.250) the session had in fact been restarted. Treat it as unknown and restart.
 - The downstream resolver does substring matching: an ID containing `opus`/`sonnet`/`haiku` routes to that family (so `claude-haiku-4-5-20251001` works).
-- IDs matching no family (e.g. `gpt-5.4-mini`) **silently fall back to parent-inherit** — not an API error. A typo will not announce itself; check usage or `--debug` if a subagent seems to run on the wrong model.
+- IDs matching no family (e.g. `gpt-5.4-mini`) **silently fall back to parent-inherit** — not an API error. A typo will not announce itself; check usage or `--debug` if a subagent seems to run on the wrong model. Gateway-routed ids do reach their provider: on 2.1.250 a subagent launched with `gpt-5.6-luna[1M]` logged `gpt-5.6-luna` as its own model, not the parent's.
 
 ## Caveats
 
 1. **macOS signing** — apply/revert re-sign ad-hoc; Gatekeeper may prompt on first launch.
 2. **Windows signing** — Authenticode becomes `HashMismatch`. The binary still runs; SmartScreen/AppLocker may flag it depending on policy.
 3. **Auto-update resets the patch** — every new version ships a fresh unpatched binary. Re-apply per version. Because the anchor is derived, a new build normally needs no doc change; only a change to the landmark text itself would.
-4. **Keep the sidecar** — `<bin>.rtk-subagent-model.json` is what makes an exact revert possible after aliases drift; a patched binary alone cannot reconstruct them.
-5. **Backup rotation** — each apply leaves a ~290 MB `.bak.<ts>`. Prune: `ls -t "$BIN".bak.* | tail -n +3 | xargs -r rm`.
+4. **Keep the sidecar** — `<bin>.rtk-subagent-model.json` is what makes an exact revert possible after aliases drift; a patched binary alone cannot reconstruct them. It also holds `graphEdits`, the original bytecode-slice length; lose it and the module stays source-compiled after a revert.
+5. **Startup cost** — the patched module compiles from source instead of loading bytecode: ~50 ms on 2.1.250 (3.9 MB chunk). Every other module keeps its bytecode.
+6. **Backup rotation** — each apply leaves a ~290 MB `.bak.<ts>`. Prune: `ls -t "$BIN".bak.* | tail -n +3 | xargs -r rm`.
 
 ## Changelog
 
 | Date | Version | Note |
 |------|---------|------|
+| 2026-08-30 | 1.8.0 | **The 2.1.250 build began running a JSC bytecode copy of each module**, so this patch — which edits the JS source — was applied, reported `patched`, and did nothing. Found by A/B: writing a different marker into each of the two copies of a help string and running `--help` shows which one executes. `apply` now also zeroes the `bytecode` slice length of the module whose `contents` range holds the patch site, making bun compile that module's source; `scan` gained a `patched-inert` state so a shadowed marker can no longer read as success. Costs ~50 ms of startup. Verified end-to-end on 2.1.250 macOS arm64: apply → the Agent tool's `model` loses its enum and a subagent really runs on `gpt-5.6-luna[1M]`; repair of an already-inert binary; revert restores both the enum and the bytecode slice. Also corrected the long-standing "no restart required" claim, which had one 2.1.133 data point behind it and was never reproduced. |
 | 2026-08-28 | 1.7.1 | Applied to 2.1.239 and 2.1.250 macOS arm64, no derivation change needed. Aliases drifted twice (`Lr`/`H` on 2.1.239 → `le`/`i` on 2.1.250) and 2.1.250 shrank the binary from 310 MB to 197 MB, but the landmark and 40-byte 4-enum are unchanged and the derived anchor matched first try on both. |
 | 2026-05-06 | 1.0 | Initial — 2.1.116/119/121, 32-byte 3-alias enum, macOS 2-instance bundle. |
 | 2026-05-08 | 1.1 | Windows port — 1-instance bundle, rename-swap for the file lock, Node scanner, signature left invalid. |
