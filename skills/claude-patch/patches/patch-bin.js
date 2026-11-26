@@ -102,11 +102,42 @@ const RESUMEMODEL = {
   reasonMap: 'unknown_family:"not a model this version of Claude Code recognizes"',
 };
 
+const CODEMODEGW = {
+  marker: 'RTK-CODE-MODE-GW',
+  markComment: '/*RTK-CODE-MODE-GW*/',
+  // Only Code Mode's eligibility check returns both reasons in one ternary.
+  landmark: '?"headless_provider":"provider";',
+  // `if(<gw>())return"provider";if(<3p>())return <headless>()` — gateway, then 3P/proxy.
+  eligRe: /if\(([\w$]{1,8})\(\)\)return"provider";if\(([\w$]{1,8})\(\)\)return [\w$]{1,8}\(\)$/,
+  eligPre: 'return"engine";',
+  eligPost: ['return"credentials"', 'return"compliance"', 'return"otel"'],
+  // Policy review repeats the same two calls; built from the captured names, never assumed.
+  review: (gw, tp) => `if(${gw}()||${tp}())return"provider";`,
+  reviewPre: 'return"otel";',
+  reviewPost: 'return"model"',
+  headlessTail: '?"headless_provider":void 0',
+  // Headless launch: `…?"credential_changed":<hp>()?"headless_provider":void 0`.
+  launchRe: /\?"credential_changed":([\w$]{1,8})\(\)$/,
+  // Mid-session veto: `…?"compliance":<3p>()||<hp>()?"headless_provider":void 0`.
+  vetoRe: /\?"compliance":([\w$]{1,8})\(\)\|\|([\w$]{1,8})\(\)$/,
+  // Interactive sessions re-check after setup (`closeCodeModeOptInAfterSetup`); headless never
+  // reaches it, which is why a 4-site patch passed `claude -p` and still refused in the TUI.
+  close: (gw, tp) => `${gw}()||${tp}()?"provider":`,
+  closePre: '?"otel":',
+  closePost: '?"model":void 0',
+  // …and then installs a provider-only veto: `<set>(()=><3p>()?"provider":void 0),"none"`.
+  // Dropping the call leaves any earlier admin/compliance veto in place.
+  closeVetoRe: tp => new RegExp(`\\.signedInAs=[\\w$]{1,8}\\(\\),([\\w$]{1,8}\\(\\(\\)=>${tp.replace(/\$/g, '\\$')}\\(\\)\\?"provider":void 0\\),)"none"`),
+  // Proves the sites belong to Code Mode and not some other provider-gated feature.
+  reasonText: 'case"provider":return"it isn\'t offered yet through a gateway or proxy',
+};
+
 const PATCHES = {
   'subagent-model': { marker: SUBAGENT.marker, derive: deriveSubagentSites },
   'auto-compact-by-model': { marker: AUTOCOMPACT.marker, derive: deriveAutocompactSites },
   'free-opus': { marker: FREEOPUS.marker, derive: deriveFreeOpusSites },
   'resume-model': { marker: RESUMEMODEL.marker, derive: deriveResumeModelSites },
+  'code-mode-gateway': { marker: CODEMODEGW.marker, derive: deriveCodeModeGwSites },
 };
 
 // --- io helpers ------------------------------------------------------------
@@ -387,6 +418,84 @@ function deriveResumeModelSites(file) {
       : null;
 
     return { offset, anchor, varName, retiredCall: shape ? shape[1] : null, replacement, preMatch, postMatch, isAnchor };
+  });
+}
+
+// Six sites, one restriction: interactive eligibility, policy review, post-setup close and its
+// veto; headless launch and mid-session veto. They are patched all-or-nothing — a half-patched set would still refuse,
+// only with a different reason — so every site's postMatch requires the whole set to derive.
+function deriveCodeModeGwSites(file) {
+  const c = CODEMODEGW;
+  const reasonOk = findAll(file, c.reasonText).length > 0;
+  const sites = [];
+  const names = [];
+
+  for (const lm of findAll(file, c.landmark)) {
+    const back = readAt(file, Math.max(0, lm - 160), Math.min(160, lm));
+    const m = c.eligRe.exec(back);
+    const anchor = m ? m[0] + c.landmark : null;
+    const offset = m ? lm - m[0].length : lm;
+    const pre = m ? back.slice(0, back.length - m[0].length).endsWith(c.eligPre) : false;
+    const after = readAt(file, lm + c.landmark.length, 400);
+    const post = c.eligPost.every(s => after.includes(s));
+    if (m) names.push({ gw: m[1], tp: m[2] });
+    sites.push({ kind: 'eligibility', offset, anchor, preMatch: pre, postMatch: post, isAnchor: m !== null });
+  }
+
+  for (const { gw, tp } of names) {
+    const needle = c.review(gw, tp);
+    for (const offset of findAll(file, needle)) {
+      const pre = readAt(file, offset - c.reviewPre.length, c.reviewPre.length) === c.reviewPre;
+      const post = readAt(file, offset + needle.length, 64).includes(c.reviewPost);
+      sites.push({ kind: 'review', offset, anchor: needle, preMatch: pre, postMatch: post, isAnchor: true });
+    }
+  }
+
+  for (const { gw, tp } of names) {
+    const needle = c.close(gw, tp);
+    for (const at of findAll(file, c.closePre + needle)) {
+      const offset = at + c.closePre.length;
+      const post = readAt(file, offset + needle.length, 32).includes(c.closePost);
+      sites.push({ kind: 'close', offset, anchor: needle, preMatch: true, postMatch: post, isAnchor: true });
+    }
+    const re = c.closeVetoRe(tp);
+    for (const at of findAll(file, '.signedInAs=')) {
+      const win = readAt(file, at, 96);
+      const m = re.exec(win);
+      if (!m || m.index !== 0) continue;
+      sites.push({ kind: 'closeVeto', offset: at + m[0].indexOf(m[1]), anchor: m[1], preMatch: true, postMatch: true, isAnchor: true });
+    }
+  }
+
+  const launch = [];
+  const veto = [];
+  for (const tl of findAll(file, c.headlessTail)) {
+    const back = readAt(file, Math.max(0, tl - 64), Math.min(64, tl));
+    const l = c.launchRe.exec(back);
+    const v = c.vetoRe.exec(back);
+    if (l) launch.push({ tl, hp: l[1], call: `${l[1]}()` });
+    if (v) veto.push({ tl, tp: v[1], hp: v[2], call: `${v[1]}()||${v[2]}()` });
+  }
+  const hps = new Set(launch.map(x => x.hp));
+  const tps = new Set(names.map(x => x.tp));
+  for (const x of launch) {
+    sites.push({ kind: 'launch', offset: x.tl - x.call.length, anchor: x.call + c.headlessTail, preMatch: true, postMatch: true, isAnchor: true });
+  }
+  for (const x of veto) {
+    // Backreferences across sites: the veto must call the same 3P check as eligibility and
+    // the same headless check as the launch site, or it is not the code being cut.
+    const ok = tps.has(x.tp) && hps.has(x.hp);
+    sites.push({ kind: 'veto', offset: x.tl - x.call.length, anchor: x.call + c.headlessTail, preMatch: ok, postMatch: true, isAnchor: true });
+  }
+
+  const count = k => sites.filter(s => s.kind === k && s.isAnchor).length;
+  const n = count('eligibility');
+  const complete = reasonOk && n > 0 && ['review', 'close', 'closeVeto', 'launch', 'veto'].every(k => count(k) === n);
+  return sites.map(s => {
+    const postMatch = s.postMatch && complete;
+    const body = s.kind === 'launch' || s.kind === 'veto' ? `void 0${c.markComment}` : c.markComment;
+    const replacement = s.isAnchor && s.preMatch && postMatch ? padTo(body, s.anchor.length) : null;
+    return { ...s, postMatch, replacement };
   });
 }
 

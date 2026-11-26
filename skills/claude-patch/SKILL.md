@@ -43,6 +43,7 @@ node patches/patch-bin.js list                                   # registered pa
 | [auto-compact-by-model](patches/auto-compact-by-model.md) | Model-aware extended-context compact targets (Claude ≈400K, GPT ≈300K) |
 | [free-opus](patches/free-opus.md) | Drop the Opus-5-only `heron_brook` section that forbids spawning subagents/workflows |
 | [resume-model](patches/resume-model.md) | Keep a session's model on `--resume` when this build does not recognise the id |
+| [code-mode-gateway](patches/code-mode-gateway.md) | Allow Code Mode through a gateway, proxy, or third-party provider |
 
 Commands: `apply <patch>`, `revert <patch>`, `status` (scan every patch), `list`.
 
