@@ -87,6 +87,8 @@ record = 52 bytes: name, contents, sourcemap, bytecode, module_info,
 
 The record is found by asking which module's `contents` range contains the patch offset — never by chunk name, which is content-hashed and changes every build. Layout is from bun's `src/standalone_graph/StandaloneModuleGraph.rs`; if the trailer does not decode, `scan` says so and `apply` warns rather than guessing.
 
+On **bun 1.4.4** (2.1.318) a module's bytecode `len` is no longer its own size. Every slice runs from the module's offset to the end of one shared region (`offset + len` is the same for every record), so `scan` shows ~100 MB for a module whose real bytecode is a few KB. Zeroing it still disables the cache, as checked behaviourally. Don't read `len` as a startup-cost estimate.
+
 Cost is one module compiled at startup instead of loaded: **~50 ms** measured on 2.1.250 for the 3.9 MB chunk holding the Agent tool (init 0.235s → 0.283s). Other modules keep their bytecode.
 
 Two states matter:

@@ -36,6 +36,10 @@ const SUBAGENT = {
   postDesc: 'Optional model override for this agent.',
   // `.enum(["sonnet","opus","haiku"])`, `v.enum([...,"fable"])`, `Mr([...])` — any alias.
   enumRe: /^[\w$.]{0,12}\(\["sonnet","opus","haiku"(?:,"fable")?\]\)$/,
+  // 2.1.318 hoisted the array into a module constant: `B(VFi)`, `VFi=["sonnet",…]`. The
+  // reference is only an anchor once its definition is proven to be that alias array.
+  hoistedRe: /^[\w$.]{0,12}\(([\w$]{1,12})\)$/,
+  aliasArray: /^\["sonnet","opus","haiku"(?:,"fable")?\]/,
   // The sibling `subagent_type` factory, reused as the unconstrained replacement.
   stringRe: /^[\w$.]{1,16}\(\)$/,
 };
@@ -259,10 +263,28 @@ function deriveSubagentSites(file) {
     const stringExpr = s < 0 ? null : before.slice(s + 'subagent_type:'.length);
     const preMatch = stringExpr !== null && c.stringRe.test(stringExpr);
 
-    const isAnchor = anchor !== null && c.enumRe.test(anchor);
-    const replacement = isAnchor && preMatch ? padTo(stringExpr + c.markComment, anchor.length) : null;
+    const hoisted = anchor === null ? null : c.hoistedRe.exec(anchor);
+    const aliasRef = hoisted && definesAliasArray(file, hoisted[1]) ? hoisted[1] : null;
+    const isAnchor = anchor !== null && (c.enumRe.test(anchor) || aliasRef !== null);
 
-    return { offset, anchor, stringExpr, replacement, preMatch, postMatch, isAnchor };
+    // A hoisted anchor (`B(VFi)`, 6 bytes) has no room for the 22-byte marker comment, so
+    // the string factory goes in bare and the padding is the marker: a minifier never
+    // emits whitespace before `.optional()`, so `o()   ` cannot occur in a pristine build.
+    const bare = preMatch && anchor !== null && anchor.length > stringExpr.length
+      ? stringExpr.padEnd(anchor.length, ' ') : null;
+    const replacement = isAnchor && preMatch
+      ? padTo(stringExpr + c.markComment, anchor.length) || bare
+      : null;
+    const patchedUnmarked = !isAnchor && postMatch && bare !== null && anchor === bare;
+
+    return { offset, anchor, aliasRef, stringExpr, replacement, preMatch, postMatch, isAnchor, patchedUnmarked };
+  });
+}
+
+function definesAliasArray(file, id) {
+  return findAll(file, `${id}=[`).some(o => {
+    const head = readAt(file, o - 1, id.length + 64);
+    return !/[\w$]/.test(head[0]) && SUBAGENT.aliasArray.test(head.slice(id.length + 2));
   });
 }
 
@@ -372,8 +394,12 @@ function deriveResumeModelSites(file) {
 
 function scan(file, patchId) {
   const patch = PATCHES[patchId];
-  const markerOffsets = findAll(file, patch.marker);
   const sites = patch.derive(file);
+  // Sites patched without room for a marker comment count as markers by shape.
+  const markerOffsets = [
+    ...findAll(file, patch.marker),
+    ...sites.filter(s => s.patchedUnmarked).map(s => s.offset),
+  ].sort((x, y) => x - y);
   const anchors = sites.filter(s => s.isAnchor);
   const notes = [];
 

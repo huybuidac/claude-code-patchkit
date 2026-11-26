@@ -7,8 +7,8 @@ Unlock the `model` parameter on the Agent/Task tool from a fixed model-alias enu
 | Field | Value |
 |-------|-------|
 | Author | @huybuidac |
-| Version | 1.8.0 |
-| Tested versions | 2.1.116 → 2.1.250 macOS arm64; 2.1.x Windows arm64 (see [Changelog](#changelog)) |
+| Version | 1.9.3 |
+| Tested versions | 2.1.116 → 2.1.332 macOS arm64; 2.1.x Windows arm64 (see [Changelog](#changelog)) |
 | Risk level | low |
 | Reversible | yes (sidecar reverse-patch, or backup) |
 | Platforms | macOS (arm64/x86_64), Linux, Windows (arm64/x64) |
@@ -54,6 +54,7 @@ The patch site has been rewritten by the minifier three times, and every hardcod
 | 3 | **stringExpr** = bytes between the preceding `subagent_type:` and the start of `LM` |
 | 4 | post-guard: `Optional model override for this agent.` must appear within ~160 bytes after `.optional().describe(` |
 | 5 | validate `anchor` against `^[\w$.]{0,12}\(\["sonnet","opus","haiku"(,"fable")?\]\)$` and `stringExpr` against `^[\w$.]{1,16}\(\)$` |
+| 5b | **or** the hoisted form `^[\w$.]{0,12}\(<ID>\)$` — accepted only if the binary defines `<ID>=["sonnet","opus","haiku"(,"fable")?]` (preceded by a non-identifier byte). An unresolved reference is not an anchor. |
 
 Why step 3 is safe: `subagent_type` is an unconstrained string schema declared in the **same statement**, so its factory expression is already proven valid in that exact lexical scope — it drops straight in where the enum was, with no separate lookup.
 
@@ -65,13 +66,15 @@ What the derivation yields per era (one rule, all eras):
 | 2.1.170–2.1.223 | `v.enum(["sonnet","opus","haiku","fable"])` | `v.string()` | 41 |
 | 2.1.224 | `xr(["sonnet","opus","haiku","fable"])` | `N()` | 37 |
 | 2.1.233 | `Mr(["sonnet","opus","haiku","fable"])` | `F()` | 37 |
+| 2.1.318 | `B(VFi)` — `VFi=["sonnet","opus","haiku","fable"]` hoisted into another chunk | `o()` | 6 |
 
-Four things have drifted independently — all are **outputs** of the derivation, never inputs:
+Five things have drifted independently — all are **outputs** of the derivation, never inputs:
 
 1. **Enum content/length** — `"fable"` added at 2.1.170 (32 → 40 bytes of enum call).
 2. **Call form** — method-chain (`X.enum([...])`) → destructured direct call (`xr([...])`) at 2.1.224, consistent with Zod's tree-shakable API.
 3. **Minified aliases** — `h`/`v`/`xr`/`Mr` and `h.string()`/`N`/`F`, roughly every few builds.
 4. **Quote style of the following `.describe()`** — flipped `"` → backtick at 2.1.176 when the text gained an apostrophe. The post-guard matches the prefix `.optional().describe(` plus the stable text, never the quote byte.
+5. **Hoisting** — at 2.1.318 the array became an exported module constant, imported by the Agent chunk. `VFi` has exactly one use (this schema).
 
 Bundle multiplicity is also unstable (macOS 2 instances ≤ 2.1.132, 1 since 2.1.133; Windows always 1) — hence step 1 counts rather than asserts.
 
@@ -81,7 +84,16 @@ Bundle multiplicity is also unstable (macOS 2 instances ≤ 2.1.132, 1 since 2.1
 replacement = stringExpr + "/*RTK-SUBAGENT-PATCH*/" right-padded with spaces to len(anchor)
 ```
 
-Length-preserving by construction; requires `len(stringExpr) + 22 <= len(anchor)`, which holds in every era (tightest is ≤ 2.1.169: 10 + 22 = 32 ≤ 33). Result on 2.1.233:
+Length-preserving by construction; needs `len(stringExpr) + 22 <= len(anchor)`. That held for every inline era (tightest is ≤ 2.1.169: 10 + 22 = 32 ≤ 33) but **not** for the hoisted anchor (`B(VFi)` = 6 bytes). Then the replacement is the **bare** `stringExpr` padded with spaces, and the padding is the marker:
+
+```
+replacement = stringExpr right-padded with spaces to len(anchor)     # needs len(anchor) > len(stringExpr)
+model:o()   .optional().describe(`Optional model override…          # 2.1.318
+```
+
+A minifier never emits whitespace before `.optional()`, so `<stringExpr> +` in the slot after the landmark (with the post-guard intact) is counted as a marker by shape (`patchedUnmarked`). `grep RTK-SUBAGENT-PATCH` finds nothing on such a binary — use `scan`.
+
+Result on 2.1.233:
 
 ```
 model:F()/*RTK-SUBAGENT-PATCH*/            .optional().describe(`Optional model override…
@@ -143,6 +155,12 @@ Functional test — in a fresh session, spawn an Agent with a full model ID (`mo
 
 | Date | Version | Note |
 |------|---------|------|
+| 2026-11-25 | 1.9.3 | Applied to 2.1.332 macOS arm64 (366 MB), no derivation change needed. All three names drifted: enum factory `B` → `U`, hoisted constant `Z6a` → `d6l`, string factory `r` → `o` (`U(d6l)` → `o()   `). Bytecode rec#1024 zeroed. Verified via `mcp serve` + `tools/list`: the patched binary has no `enum`, the backup still does. |
+| 2026-11-18 | 1.9.2 | Applied to 2.1.327 macOS arm64 (338 MB), no derivation change needed. Both names drifted: the hoisted constant `C8i` → `Z6a` and the string factory `o` → `r` (`B(Z6a)` → `r()   `). Bytecode rec#903 zeroed. Verified via `mcp serve` + `tools/list`: the patched binary has no `enum`, the backup still does. |
+| 2026-11-11 | 1.9.1 | Applied to 2.1.322 macOS arm64 (309 MB), no derivation change needed. The hoisted constant was renamed `VFi` → `C8i`; the hoisted-form rule resolved it first try (`B(C8i)` → `o()   `). Bytecode rec#799 zeroed. Verified via `mcp serve` + `tools/list`: patched binary shows `model` as a bare `{"type":"string"}`, while the backup still has the enum. |
+| 2026-11-05 | 1.9.0 | **2.1.318 hoisted the enum array** into an exported constant (`VFi=["sonnet","opus","haiku","fable"]` in another chunk), so the slot became `B(VFi)`: landmark 1, anchor 0, state `abnormal`. The derivation now also accepts `<E>(<ID>)` once `<ID>` resolves to the alias array. 6 bytes cannot hold the 22-byte marker, so the replacement is the bare `o()` + 3 spaces and `scan` recognises the patched slot by shape. Bun 1.4.4 also changed what the bytecode `len` means (see SKILL.md); zeroing it still disables the cache. Verified via `mcp serve` + `tools/list`: before, `"enum":["sonnet","opus","haiku","fable"]`; after, bare `{"type":"string"}`. Revert on a copy restores the enum. |
+| 2026-09-23 | 1.8.2 | Applied to 2.1.280 macOS arm64 (207 MB), no derivation change needed. Same `V`/`o` aliases as 2.1.274; bytecode still shadows (rec#480, 115128 → 0). Verified via `mcp serve` + `tools/list`: Agent `model` is a bare `{"type":"string"}`, no `enum`. |
+| 2026-09-17 | 1.8.1 | Applied to 2.1.274 macOS arm64 (204 MB), no derivation change needed. The anchor derived to `V(["sonnet","opus","haiku","fable"])` / `o()` — aliases drifted again from 2.1.250's `le`/`i`, and the derived rule absorbed it first try. Bytecode still shadows (rec#518, 118048 → 0). Verified behaviourally, not by marker count: `mcp serve` + `tools/list` shows the Agent tool's `model` as a bare `{"type":"string"}` with no `enum`. |
 | 2026-08-30 | 1.8.0 | **The 2.1.250 build began running a JSC bytecode copy of each module**, so this patch — which edits the JS source — was applied, reported `patched`, and did nothing. Found by A/B: writing a different marker into each of the two copies of a help string and running `--help` shows which one executes. `apply` now also zeroes the `bytecode` slice length of the module whose `contents` range holds the patch site, making bun compile that module's source; `scan` gained a `patched-inert` state so a shadowed marker can no longer read as success. Costs ~50 ms of startup. Verified end-to-end on 2.1.250 macOS arm64: apply → the Agent tool's `model` loses its enum and a subagent really runs on `gpt-5.6-luna[1M]`; repair of an already-inert binary; revert restores both the enum and the bytecode slice. Also corrected the long-standing "no restart required" claim, which had one 2.1.133 data point behind it and was never reproduced. |
 | 2026-08-28 | 1.7.1 | Applied to 2.1.239 and 2.1.250 macOS arm64, no derivation change needed. Aliases drifted twice (`Lr`/`H` on 2.1.239 → `le`/`i` on 2.1.250) and 2.1.250 shrank the binary from 310 MB to 197 MB, but the landmark and 40-byte 4-enum are unchanged and the derived anchor matched first try on both. |
 | 2026-05-06 | 1.0 | Initial — 2.1.116/119/121, 32-byte 3-alias enum, macOS 2-instance bundle. |
