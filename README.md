@@ -40,6 +40,7 @@ Inside a Claude Code session:
 /claude-patch                               # Interactive mode
 /claude-patch apply subagent-model          # Apply specific patch
 /claude-patch apply auto-compact-by-model   # Claude ≈400K, GPT ≈300K
+/claude-patch apply code-mode-gateway       # Code Mode through a gateway/proxy
 /claude-patch revert subagent-model         # Revert to backup
 /claude-patch status                        # Show all patch states
 ```
@@ -51,6 +52,8 @@ Inside a Claude Code session:
 | [subagent-model](skills/claude-patch/patches/subagent-model.md) | Unlock `model` param on Agent tool — use any model id per-call | Low |
 | [auto-compact-by-model](skills/claude-patch/patches/auto-compact-by-model.md) | Model-aware extended-context compact targets: Claude ≈400K, GPT ≈300K | Medium |
 | [free-opus](skills/claude-patch/patches/free-opus.md) | Drop the Opus-5-only `heron_brook` section that forbids spawning subagents/workflows | Low |
+| [resume-model](skills/claude-patch/patches/resume-model.md) | Keep a session's model on `--resume` when this build does not recognise the id | Medium |
+| [code-mode-gateway](skills/claude-patch/patches/code-mode-gateway.md) | Allow Code Mode (`CLAUDE_CODE_EXPERIMENTAL_CODE_MODE`) through a gateway, proxy, or third-party provider | Low |
 
 ### Freeing Opus 5 from the delegation ban
 
@@ -63,6 +66,24 @@ claude -p --model opus "Does your system prompt contain the phrase 'unless the u
 ```
 
 Optionally add `CLAUDE_CODE_THISTLE_GREBE=default` to pin the separate delegation-steer experiment away from its `no_nudges` / `counter_steer` arms — see the patch doc for what that is and is not worth.
+
+### Code Mode through a gateway
+
+Code Mode replaces the ordinary tools with a `REPL` tool. Claude writes a JavaScript script that calls Bash, Read, Edit, MCP tools and so on, so many tool calls run within one model turn. Runs that are mostly tool calls finish much faster. With `ANTHROPIC_BASE_URL` pointing anywhere but `api.anthropic.com`, every launch refuses it:
+
+```
+Code Mode (experimental) isn't available: it isn't offered yet through a gateway or proxy, or with Claude for Government.
+```
+
+The mode itself is client-side, and no setting skips the check. The patch cuts the provider check at all six sites and leaves the credentials, compliance, model and killswitch gates alone. Two of those sites run only in the interactive TUI, so verify there and not just with `claude -p`:
+
+```bash
+node skills/claude-patch/patches/patch-bin.js apply --patch code-mode-gateway
+# restart; with CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=1 the TUI should say
+#   "Code Mode (experimental) is on"
+```
+
+Tested on 2.1.332 macOS arm64 through a gateway.
 
 ### Model-aware auto-compaction
 
@@ -85,15 +106,22 @@ Claude Code is distributed as a bun-compiled binary with embedded JS bundles. So
 4. **Backup** — `<binary>.bak.<timestamp>`, plus a `<binary>.rtk-<patch>.json` sidecar recording the original bytes
 5. **Verified write** — each offset is checked against its expected bytes before being overwritten, so a stale offset aborts instead of corrupting the binary
 6. **Signature** — ad-hoc codesign on macOS; on Windows Authenticode becomes `HashMismatch` (binary still runs)
-7. **Self-verify** — re-scan and confirm the marker count
+7. **Bytecode** — since 2.1.250, also disable the JSC bytecode cache of the patched module (see below)
+8. **Self-verify** — re-scan and confirm the marker count, and that nothing shadows it
 
 ### Anchors are derived, not hardcoded
 
-The bundler renames minified identifiers every few builds. A hardcoded anchor then matches 0 times — indistinguishable from "the feature was removed" — so routine drift looks like a broken fingerprint. Real examples from `subagent-model`: `.enum([...])` → `xr([...])` → `Mr([...])`, three rewrites in four months.
+The bundler renames minified identifiers every few builds. A hardcoded anchor then matches 0 times — indistinguishable from "the feature was removed" — so routine drift looks like a broken fingerprint. Real examples from `subagent-model`: `.enum([...])` → `xr([...])` → `Mr([...])`, and then at 2.1.318 `B(VFi)`, where the alias array was hoisted into a constant in another chunk. Since then every release has renamed at least one identifier (`B(VFi)` → `B(C8i)` → `B(Z6a)` → `U(d6l)`), and the derived anchor absorbed every one without a code change.
 
 So each patch derives its anchor at scan time from landmarks that don't move: string literals the product ships (`.describe()` text, `source:"…"` labels) and positional locals the bundler assigns by position rather than name. The patch definitions document the derivation rule instead of the bytes.
 
 This also covers **bundle multiplicity** — the JS bundle is embedded 1 or 2 times depending on platform/version (macOS ≤ 2.1.132 = 2, ≥ 2.1.133 = 1, Windows = 1). Landmarks are counted, never asserted.
+
+### Bytecode shadowing
+
+Since **2.1.250** the binary ships a JSC bytecode copy of each module and runs *that* instead of the JS source. A source-only patch then leaves its marker in the file and changes nothing. `apply` therefore also zeroes the bytecode-slice length of the one module holding the patch site. bun then compiles that module from source, which is the copy the patch edits, and every other module keeps its bytecode. `scan` reports a shadowed marker as `patched-inert` rather than `patched`.
+
+**A marker count is not proof a patch works.** Each patch doc lists a behavioural check, for example `claude mcp serve` + `tools/list` for `subagent-model`, or the TUI notice for `code-mode-gateway`.
 
 ### Windows specifics
 
